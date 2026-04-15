@@ -2610,7 +2610,7 @@ TT_INLINE void tt_crosshair(int center_only) {
 }
 
 
-TT_INLINE void tt_fluid_drop(int x, int y, int radius, int ansi_color) {
+TT_INLINE void tt_circle(int x, int y, int radius, int ansi_color) {
     int dy, dx;
     char col[24];
     tt_fg(col, sizeof(col), ansi_color);
