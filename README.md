@@ -76,7 +76,6 @@ Here is a non-exhaustive list of the simple tools included:
 - `TT_Body`: Simple physics body integration.
 - `tt_rect_collide`: AABB collision detection.
 - `tt_ray_cast`, `tt_fov`, `tt_astar`: Raycasting, field of view, and pathfinding.
-- `tt_mandelbrot`: Because we could.
 
 ### Data Structures
 - `TT_DArr`: Dynamic array.
