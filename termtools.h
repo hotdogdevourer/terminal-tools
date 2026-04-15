@@ -139,7 +139,9 @@
 #  include <sys/stat.h>
 #  define TT_PATH_SEP '\\'
 #  define TT_NEWLINE  "\r\n"
-#  pragma comment(lib, "winmm.lib")                    
+#  ifdef _MSC_VER
+#    pragma comment(lib, "winmm.lib")                    
+#  endif
 #else
 #  include <unistd.h>
 #  include <sys/ioctl.h>
@@ -894,32 +896,6 @@ TT_INLINE double tt_raycast(const char **map2d, int map_h,
         if (map2d[my][mx] == '#') return d;
     }
     return (double)maxd;
-}
-
-
-TT_INLINE void tt_mandelbrot(int x, int y, int width, int height, int max_iter) {
-    static const char shading[] = " .:-=+*#%@";
-    int i, j;
-    for (j = 0; j < height; j++) {
-        char *line = (char*)malloc((size_t)width + 1);
-        if (!line) return;
-        for (i = 0; i < width; i++) {
-            double cr = (double)(i - width/2)  * 3.0 / (double)width;
-            double ci = (double)(j - height/2) * 2.0 / (double)height;
-            double zr = 0.0, zi = 0.0;
-            int k;
-            for (k = 0; k < max_iter; k++) {
-                double t = zr*zr - zi*zi + cr;
-                zi = 2.0*zr*zi + ci;
-                zr = t;
-                if (zr*zr + zi*zi > 4.0) break;
-            }
-            line[i] = shading[k * 10 / max_iter % 10];
-        }
-        line[width] = '\0';
-        tt_draw(x, y+j, line);
-        free(line);
-    }
 }
 
 
@@ -3114,7 +3090,7 @@ TT_INLINE void tt_self_test(void) {
 
 #define TT_DRAW(x,y,s)        tt_draw((x),(y),(s))
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
-#  define TT_DRAWF(x,y,...)     tt_drawf((x),(y),__VA_ARGS__)
+#  define TT_DRAWF(x,y,...)   tt_drawf((x),(y),__VA_ARGS__)
 #endif
 #define TT_GOTO(x,y)          tt_goto((x),(y))
 #define TT_CLEAR()            tt_clear()
