@@ -35,6 +35,9 @@
  * USAGE
  *   #define TERMTOOLS_IMPLEMENTATION   (in exactly ONE .c / .cpp file)
  *   #include "termtools.h"
+ * 
+ *   Define to enable socket support
+ *   #define TT_ENABLE_SOCKETS
  *
  * LICENSE: MIT
  *
@@ -46,6 +49,7 @@
  *
  * And as always, thanks for using our software <3! - TERMTOOLS Contributors
  */
+
 
 #if !defined(_WIN32) && !defined(__MSDOS__)
 #  if !defined(_POSIX_C_SOURCE) || _POSIX_C_SOURCE < 199309L
@@ -87,6 +91,11 @@
 #  define TT_POSIX 1                            
 #endif
 
+#if defined(__GNUC__)
+#  define TT_UNUSED __attribute__((unused))
+#else
+#  define TT_UNUSED
+#endif
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
 #  include <stdint.h>
@@ -131,7 +140,10 @@
 #include <limits.h>
 
 #ifdef TT_WINDOWS
-#  define WIN32_LEAN_AND_MEAN
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
 #  include <windows.h>
 #  include <conio.h>
 #  include <io.h>
@@ -2627,19 +2639,23 @@ TT_INLINE void tt_circle(int x, int y, int radius, int ansi_color) {
 }
 
 
-TT_INLINE void tt_screen_noise(double density) {
-    static const char *chars[] = {".", ":", "+", "*", "#"};
+
+TT_INLINE void tt_screen_noise(double density, const char **chars) {
     TT_Size sz = tt_term_size();
     int x, y;
+    int count = 0;
+    
+    while (chars[count]) count++;
+    if (count == 0) return;
+
     for (y = 1; y <= sz.h; y++) {
         for (x = 1; x <= sz.w; x++) {
             if (tt_randf() < density) {
-                tt_draw(x, y, chars[tt_rand() % 5]);
+                tt_draw(x, y, chars[tt_rand() % count]);
             }
         }
     }
 }
-
 
 typedef struct { const char *cmd; const char *desc; } TT_HelpItem;
 
@@ -3106,8 +3122,2688 @@ TT_INLINE void tt_self_test(void) {
 #define TT_CLAMPF(v,lo,hi)    tt_clamp_f((v),(lo),(hi))
 #define TT_RAND()             tt_rand()
 #define TT_RANDF()            tt_randf()
-#define TT_RAND_RANGE(lo,hi)  tt_rand_range((lo),(hi))
 
+
+
+typedef struct {
+    tt_u32  *d;                                           
+    int      len;                                          
+    int      used;                                         
+    int      sign;                                         
+} TT_BigInt;
+
+TT_INLINE int tt_bigint_init(TT_BigInt *n, int capacity) {
+    n->d    = (tt_u32*)calloc((size_t)capacity, sizeof(tt_u32));
+    n->len  = capacity;
+    n->used = 0;
+    n->sign = 1;
+    return n->d != NULL;
+}
+
+TT_INLINE void tt_bigint_free(TT_BigInt *n) {
+    free(n->d); n->d = NULL; n->len = n->used = 0;
+}
+
+TT_INLINE void tt_bigint_zero(TT_BigInt *n) {
+    memset(n->d, 0, (size_t)n->len * sizeof(tt_u32));
+    n->used = 0; n->sign = 1;
+}
+
+TT_INLINE void tt_bigint_norm(TT_BigInt *n) {
+    while (n->used > 0 && n->d[n->used-1] == 0) n->used--;
+}
+
+TT_INLINE int tt_bigint_is_zero(const TT_BigInt *n) {
+    int i;
+    for (i = 0; i < n->used; i++) if (n->d[i]) return 0;
+    return 1;
+}
+
+TT_INLINE void tt_bigint_copy(TT_BigInt *dst, const TT_BigInt *src) {
+    int cap = src->used < dst->len ? src->used : dst->len;
+    memcpy(dst->d, src->d, (size_t)cap * sizeof(tt_u32));
+    memset(dst->d + cap, 0, (size_t)(dst->len - cap) * sizeof(tt_u32));
+    dst->used = src->used;
+    dst->sign = src->sign;
+}
+
+TT_INLINE void tt_bigint_set_u32(TT_BigInt *n, tt_u32 v) {
+    tt_bigint_zero(n);
+    if (v) { n->d[0] = v; n->used = 1; }
+}
+
+TT_INLINE void tt_bigint_set_u64(TT_BigInt *n, tt_u64 v) {
+    tt_bigint_zero(n);
+    n->d[0] = (tt_u32)(v & 0xFFFFFFFFu);
+    n->d[1] = (tt_u32)(v >> 32);
+    n->used = n->d[1] ? 2 : (n->d[0] ? 1 : 0);
+}
+
+TT_INLINE int tt_bigint_cmp_mag(const TT_BigInt *a, const TT_BigInt *b) {
+    int i;
+    if (a->used != b->used) return a->used > b->used ? 1 : -1;
+    for (i = a->used - 1; i >= 0; i--) {
+        if (a->d[i] > b->d[i]) return  1;
+        if (a->d[i] < b->d[i]) return -1;
+    }
+    return 0;
+}
+
+TT_INLINE int tt_bigint_cmp(const TT_BigInt *a, const TT_BigInt *b) {
+    if (a->sign != b->sign) {
+        if (tt_bigint_is_zero(a) && tt_bigint_is_zero(b)) return 0;
+        return a->sign > b->sign ? 1 : -1;
+    }
+    if (a->sign == 1) return tt_bigint_cmp_mag(a, b);
+    return tt_bigint_cmp_mag(b, a);                        
+}
+
+static void tt__bigint_add_mag(TT_BigInt *r, const TT_BigInt *a, const TT_BigInt *b) {
+    int i, n = (a->used > b->used) ? a->used : b->used;
+    tt_u64 carry = 0;
+    for (i = 0; i < n || carry; i++) {
+        tt_u64 ai = (i < a->used) ? a->d[i] : 0;
+        tt_u64 bi = (i < b->used) ? b->d[i] : 0;
+        tt_u64 s  = ai + bi + carry;
+        r->d[i]   = (tt_u32)(s & 0xFFFFFFFFu);
+        carry     = s >> 32;
+    }
+    r->used = i;
+}
+
+static void tt__bigint_sub_mag(TT_BigInt *r, const TT_BigInt *a, const TT_BigInt *b) {
+    int i;
+    tt_i64 borrow = 0;
+    for (i = 0; i < a->used; i++) {
+        tt_i64 d  = (tt_i64)(tt_u64)a->d[i] - (i < b->used ? (tt_i64)(tt_u64)b->d[i] : 0) - borrow;
+        borrow    = d < 0 ? 1 : 0;
+        r->d[i]   = (tt_u32)((tt_u64)(d + (borrow ? (tt_i64)0x100000000LL : 0)) & 0xFFFFFFFFu);
+    }
+    r->used = a->used;
+    tt_bigint_norm(r);
+}
+
+TT_INLINE void tt_bigint_add(TT_BigInt *r, const TT_BigInt *a, const TT_BigInt *b) {
+    memset(r->d, 0, (size_t)r->len * sizeof(tt_u32));
+    if (a->sign == b->sign) {
+        tt__bigint_add_mag(r, a, b);
+        r->sign = a->sign;
+    } else {
+        int c = tt_bigint_cmp_mag(a, b);
+        if (c == 0) { r->used = 0; r->sign = 1; }
+        else if (c > 0) { tt__bigint_sub_mag(r, a, b); r->sign = a->sign; }
+        else             { tt__bigint_sub_mag(r, b, a); r->sign = b->sign; }
+    }
+    if (tt_bigint_is_zero(r)) r->sign = 1;
+}
+
+TT_INLINE void tt_bigint_sub(TT_BigInt *r, const TT_BigInt *a, const TT_BigInt *b) {
+    TT_BigInt nb; tt_bigint_init(&nb, b->len);
+    tt_bigint_copy(&nb, b); nb.sign = -b->sign;
+    tt_bigint_add(r, a, &nb);
+    tt_bigint_free(&nb);
+}
+
+TT_INLINE void tt_bigint_mul_u32(TT_BigInt *r, const TT_BigInt *a, tt_u32 x) {
+    int i;
+    tt_u64 carry = 0;
+    memset(r->d, 0, (size_t)r->len * sizeof(tt_u32));
+    for (i = 0; i < a->used; i++) {
+        tt_u64 p  = (tt_u64)a->d[i] * x + carry;
+        r->d[i]   = (tt_u32)(p & 0xFFFFFFFFu);
+        carry     = p >> 32;
+    }
+    r->used   = a->used;
+    if (carry && r->used < r->len) r->d[r->used++] = (tt_u32)carry;
+    r->sign   = a->sign;
+    tt_bigint_norm(r);
+}
+
+TT_INLINE void tt_bigint_mul(TT_BigInt *r, const TT_BigInt *a, const TT_BigInt *b) {
+    int i, j;
+    memset(r->d, 0, (size_t)r->len * sizeof(tt_u32));
+    for (i = 0; i < a->used; i++) {
+        tt_u64 carry = 0;
+        for (j = 0; j < b->used; j++) {
+            tt_u64 p = (tt_u64)a->d[i] * b->d[j] + r->d[i+j] + carry;
+            r->d[i+j] = (tt_u32)(p & 0xFFFFFFFFu);
+            carry      = p >> 32;
+        }
+        if (i + j < r->len) r->d[i+j] = (tt_u32)carry;
+    }
+    r->used = a->used + b->used;
+    if (r->used > r->len) r->used = r->len;
+    r->sign = a->sign * b->sign;
+    tt_bigint_norm(r);
+    if (tt_bigint_is_zero(r)) r->sign = 1;
+}
+
+TT_INLINE tt_u32 tt_bigint_div_u32(TT_BigInt *q, const TT_BigInt *a, tt_u32 x) {
+    int i;
+    tt_u64 rem = 0;
+    memset(q->d, 0, (size_t)q->len * sizeof(tt_u32));
+    for (i = a->used - 1; i >= 0; i--) {
+        tt_u64 cur = (rem << 32) | a->d[i];
+        q->d[i]    = (tt_u32)(cur / x);
+        rem        = cur % x;
+    }
+    q->used = a->used;
+    q->sign = a->sign;
+    tt_bigint_norm(q);
+    return (tt_u32)rem;
+}
+
+TT_INLINE void tt_bigint_shl(TT_BigInt *r, const TT_BigInt *a, int n) {
+    int wshift = n / 32, bshift = n % 32;
+    int i;
+    memset(r->d, 0, (size_t)r->len * sizeof(tt_u32));
+    for (i = a->used - 1; i >= 0; i--) {
+        int dst = i + wshift;
+        if (dst < r->len) r->d[dst] |= a->d[i] << bshift;
+        if (bshift && dst + 1 < r->len) r->d[dst+1] |= a->d[i] >> (32 - bshift);
+    }
+    r->used = a->used + wshift + 1;
+    if (r->used > r->len) r->used = r->len;
+    r->sign = a->sign;
+    tt_bigint_norm(r);
+}
+
+TT_INLINE void tt_bigint_shr(TT_BigInt *r, const TT_BigInt *a, int n) {
+    int wshift = n / 32, bshift = n % 32;
+    int i;
+    memset(r->d, 0, (size_t)r->len * sizeof(tt_u32));
+    for (i = wshift; i < a->used; i++) {
+        int dst = i - wshift;
+        if (dst < r->len) r->d[dst] |= a->d[i] >> bshift;
+        if (bshift && dst + 1 < r->len) r->d[dst+1] |= a->d[i] << (32 - bshift);
+    }
+    r->used = (a->used > wshift) ? a->used - wshift : 0;
+    if (r->used > r->len) r->used = r->len;
+    r->sign = a->sign;
+    tt_bigint_norm(r);
+}
+
+TT_INLINE void tt_bigint_and(TT_BigInt *r, const TT_BigInt *a, const TT_BigInt *b) {
+    int n = (a->used < b->used) ? a->used : b->used, i;
+    memset(r->d, 0, (size_t)r->len * sizeof(tt_u32));
+    for (i = 0; i < n && i < r->len; i++) r->d[i] = a->d[i] & b->d[i];
+    r->used = n; tt_bigint_norm(r); r->sign = 1;
+}
+
+TT_INLINE void tt_bigint_or(TT_BigInt *r, const TT_BigInt *a, const TT_BigInt *b) {
+    int n = (a->used > b->used) ? a->used : b->used, i;
+    memset(r->d, 0, (size_t)r->len * sizeof(tt_u32));
+    for (i = 0; i < n && i < r->len; i++) {
+        tt_u32 ai = (i < a->used) ? a->d[i] : 0;
+        tt_u32 bi = (i < b->used) ? b->d[i] : 0;
+        r->d[i] = ai | bi;
+    }
+    r->used = n; tt_bigint_norm(r); r->sign = 1;
+}
+
+TT_INLINE void tt_bigint_xor(TT_BigInt *r, const TT_BigInt *a, const TT_BigInt *b) {
+    int n = (a->used > b->used) ? a->used : b->used, i;
+    memset(r->d, 0, (size_t)r->len * sizeof(tt_u32));
+    for (i = 0; i < n && i < r->len; i++) {
+        tt_u32 ai = (i < a->used) ? a->d[i] : 0;
+        tt_u32 bi = (i < b->used) ? b->d[i] : 0;
+        r->d[i] = ai ^ bi;
+    }
+    r->used = n; tt_bigint_norm(r); r->sign = 1;
+}
+
+TT_INLINE void tt_bigint_gcd(TT_BigInt *g, TT_BigInt *a, TT_BigInt *b, int cap) {
+    TT_BigInt ta, tb, tr;
+    tt_bigint_init(&ta, cap); tt_bigint_init(&tb, cap); tt_bigint_init(&tr, cap);
+    tt_bigint_copy(&ta, a); ta.sign = 1;
+    tt_bigint_copy(&tb, b); tb.sign = 1;
+    while (!tt_bigint_is_zero(&tb)) {
+        int i;
+        if (tb.used == 1 && tb.d[0]) {
+            tt_u32 r2 = tt_bigint_div_u32(&tr, &ta, tb.d[0]);
+            tt_bigint_zero(&ta);
+            tt_bigint_copy(&ta, &tb);
+            tt_bigint_set_u32(&tb, r2);
+            continue;
+        }
+        {
+            TT_BigInt q2, r3;
+            tt_bigint_init(&q2, cap); tt_bigint_init(&r3, cap);
+            {
+                tt_bigint_zero(&r3);
+                for (i = ta.used * 32 - 1; i >= 0; i--) {
+                    int wi = i / 32, bi2 = i % 32;
+                    tt_u32 bit = (ta.d[wi] >> bi2) & 1u;
+                    tt_bigint_shl(&q2, &r3, 1);                 
+                    tt_bigint_copy(&r3, &q2);
+                    if (bit) r3.d[0] |= 1;
+                    if (!r3.used) r3.used = 1;
+                    if (tt_bigint_cmp_mag(&r3, &tb) >= 0)
+                        tt__bigint_sub_mag(&r3, &r3, &tb);
+                }
+            }
+            tt_bigint_copy(&ta, &tb);
+            tt_bigint_copy(&tb, &r3);
+            tt_bigint_free(&q2); tt_bigint_free(&r3);
+        }
+    }
+    tt_bigint_copy(g, &ta);
+    g->sign = 1;
+    tt_bigint_free(&ta); tt_bigint_free(&tb); tt_bigint_free(&tr);
+}
+
+TT_INLINE char *tt_bigint_to_dec(const TT_BigInt *n, char *buf, int bufsz) {
+    TT_BigInt tmp;
+    int pos = 0, start;
+    char c;
+    if (!tt_bigint_init(&tmp, n->len)) { buf[0]='\0'; return buf; }
+    tt_bigint_copy(&tmp, n); tmp.sign = 1;
+    if (tt_bigint_is_zero(&tmp)) { buf[0]='0'; buf[1]='\0'; tt_bigint_free(&tmp); return buf; }
+    if (n->sign == -1 && pos < bufsz-1) buf[pos++] = '-';
+    start = pos;
+    while (!tt_bigint_is_zero(&tmp) && pos < bufsz-1) {
+        tt_u32 rem = tt_bigint_div_u32(&tmp, &tmp, 10);
+        buf[pos++] = (char)('0' + rem);
+    }
+    buf[pos] = '\0';
+    {
+        int lo = start, hi = pos - 1;
+        while (lo < hi) { c = buf[lo]; buf[lo++] = buf[hi]; buf[hi--] = c; }
+    }
+    tt_bigint_free(&tmp);
+    return buf;
+}
+
+TT_INLINE char *tt_bigint_to_hex(const TT_BigInt *n, char *buf, int bufsz) {
+    static const char hx[] = "0123456789ABCDEF";
+    int pos = 0, i, j;
+    if (n->sign == -1 && pos < bufsz-1) buf[pos++] = '-';
+    if (tt_bigint_is_zero(n)) { buf[pos++]='0'; buf[pos]='\0'; return buf; }
+    for (i = n->used - 1; i >= 0; i--) {
+        for (j = 28; j >= 0; j -= 4) {
+            int nib = (n->d[i] >> j) & 0xF;
+            if (pos == (n->sign==-1?1:0) && nib == 0) continue;                         
+            if (pos < bufsz-1) buf[pos++] = hx[nib];
+        }
+    }
+    if (pos == (n->sign==-1?1:0)) buf[pos++] = '0';
+    buf[pos] = '\0';
+    return buf;
+}
+
+TT_INLINE void tt_bigint_from_dec(TT_BigInt *n, const char *s) {
+    TT_BigInt tmp;
+    tt_bigint_zero(n);
+    if (*s == '-') { n->sign = -1; s++; } else { n->sign = 1; if (*s=='+') s++; }
+    if (!tt_bigint_init(&tmp, n->len)) return;
+    for (; *s; s++) {
+        if (!isdigit((unsigned char)*s)) continue;
+        tt_bigint_mul_u32(&tmp, n, 10);
+        tt_bigint_copy(n, &tmp);
+        tt_bigint_zero(&tmp);
+        n->d[0] += (tt_u32)(*s - '0');
+        if (!n->used) n->used = 1;
+        tt_bigint_norm(n);
+    }
+    tt_bigint_free(&tmp);
+    if (tt_bigint_is_zero(n)) n->sign = 1;
+}
+
+TT_INLINE void tt_bigint_from_hex(TT_BigInt *n, const char *s) {
+    int i;
+    tt_bigint_zero(n);
+    if (*s == '-') { n->sign = -1; s++; } else { n->sign = 1; }
+    if (s[0]=='0' && (s[1]=='x'||s[1]=='X')) s += 2;
+    for (; *s; s++) {
+        int nib;
+        if      (*s >= '0' && *s <= '9') nib = *s - '0';
+        else if (*s >= 'a' && *s <= 'f') nib = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'F') nib = *s - 'A' + 10;
+        else continue;
+        {
+            tt_u32 carry = (tt_u32)nib;
+            for (i = 0; i < n->len; i++) {
+                tt_u64 v = ((tt_u64)n->d[i] << 4) | carry;
+                n->d[i]  = (tt_u32)(v & 0xFFFFFFFFu);
+                carry     = (tt_u32)(v >> 32);
+            }
+            if (n->used < n->len && carry) n->d[n->used] = carry;
+        }
+        tt_bigint_norm(n);
+    }
+}
+
+TT_INLINE void tt_bigint_powmod(TT_BigInt *r, const TT_BigInt *base,
+                                 const TT_BigInt *exp, const TT_BigInt *m,
+                                 int cap) {
+    TT_BigInt b, e, tmp, q2;
+    int i, wi, bi2;
+    tt_bigint_init(&b,  cap); tt_bigint_init(&e,   cap);
+    tt_bigint_init(&tmp,cap); tt_bigint_init(&q2,  cap);
+    tt_bigint_copy(&b, base);
+    tt_bigint_copy(&e, exp);
+    tt_bigint_zero(r); r->d[0] = 1; r->used = 1; r->sign = 1;
+    {
+        TT_BigInt rem2; tt_bigint_init(&rem2, cap);
+        tt_bigint_zero(&rem2);
+        for (i = b.used * 32 - 1; i >= 0; i--) {
+            wi = i/32; bi2 = i%32;
+            tt_u32 bit2 = (b.d[wi] >> bi2) & 1u;
+            tt_bigint_shl(&q2, &rem2, 1);
+            tt_bigint_copy(&rem2, &q2);
+            if (bit2) rem2.d[0] |= 1;
+            if (!rem2.used) rem2.used = 1;
+            if (tt_bigint_cmp_mag(&rem2, m) >= 0) tt__bigint_sub_mag(&rem2, &rem2, m);
+        }
+        tt_bigint_copy(&b, &rem2);
+        tt_bigint_free(&rem2);
+    }
+    for (i = e.used * 32 - 1; i >= 0; i--) {
+        TT_BigInt rr; tt_bigint_init(&rr, cap * 2);
+        tt_bigint_mul(&rr, r, r);
+        {
+            TT_BigInt rem3; tt_bigint_init(&rem3, cap);
+            tt_bigint_zero(&rem3);
+            {
+                int k;
+                for (k = rr.used * 32 - 1; k >= 0; k--) {
+                    int wk = k/32, bk = k%32;
+                    tt_u32 bit3 = (rr.d[wk] >> bk) & 1u;
+                    tt_bigint_shl(&q2, &rem3, 1);
+                    tt_bigint_copy(&rem3, &q2);
+                    if (bit3) rem3.d[0] |= 1;
+                    if (!rem3.used) rem3.used = 1;
+                    if (tt_bigint_cmp_mag(&rem3, m) >= 0) tt__bigint_sub_mag(&rem3, &rem3, m);
+                }
+            }
+            tt_bigint_copy(r, &rem3);
+            tt_bigint_free(&rem3);
+        }
+        tt_bigint_free(&rr);
+        wi  = i/32; bi2 = i%32;
+        if ((e.d[wi] >> bi2) & 1u) {
+            TT_BigInt rr2, rem4;
+            tt_bigint_init(&rr2, cap*2); tt_bigint_init(&rem4, cap);
+            tt_bigint_mul(&rr2, r, &b);
+            tt_bigint_zero(&rem4);
+            {
+                int k;
+                for (k = rr2.used*32-1; k>=0; k--) {
+                    int wk=k/32, bk=k%32;
+                    tt_u32 bit4=(rr2.d[wk]>>bk)&1u;
+                    tt_bigint_shl(&q2,&rem4,1);
+                    tt_bigint_copy(&rem4,&q2);
+                    if(bit4){rem4.d[0]|=1; if(!rem4.used) rem4.used=1;}
+                    if(tt_bigint_cmp_mag(&rem4,m)>=0) tt__bigint_sub_mag(&rem4,&rem4,m);
+                }
+            }
+            tt_bigint_copy(r, &rem4);
+            tt_bigint_free(&rr2); tt_bigint_free(&rem4);
+        }
+    }
+    tt_bigint_free(&b); tt_bigint_free(&e);
+    tt_bigint_free(&tmp); tt_bigint_free(&q2);
+}
+
+TT_INLINE int tt_bigint_is_prime(const TT_BigInt *n, int cap) {
+    static const tt_u32 witnesses[] = {2,3,5,7,11,13,17,19,23,29,31,37};
+    TT_BigInt nm1, d2, r2, w2, tmp2;
+    int s, i, j;
+    if (n->used == 0 || (n->used == 1 && n->d[0] < 2)) return 0;
+    if (n->used == 1 && n->d[0] == 2) return 1;
+    if (n->d[0] % 2 == 0) return 0;
+    tt_bigint_init(&nm1, cap); tt_bigint_init(&d2, cap);
+    tt_bigint_init(&r2,  cap); tt_bigint_init(&w2, cap);
+    tt_bigint_init(&tmp2,cap);
+    tt_bigint_copy(&nm1, n); nm1.d[0]--;
+    tt_bigint_norm(&nm1);
+    tt_bigint_copy(&d2, &nm1); s = 0;
+    while ((d2.d[0] & 1) == 0) { tt_bigint_shr(&d2, &d2, 1); s++; }
+    for (i = 0; i < (int)(sizeof(witnesses)/sizeof(witnesses[0])); i++) {
+        if (n->used == 1 && n->d[0] <= witnesses[i]) continue;
+        tt_bigint_set_u32(&w2, witnesses[i]);
+        tt_bigint_powmod(&r2, &w2, &d2, n, cap);
+        if ((r2.used==1 && r2.d[0]==1) || tt_bigint_cmp_mag(&r2,&nm1)==0) continue;
+        {
+            int composite = 1;
+            for (j = 0; j < s-1; j++) {
+                tt_bigint_mul(&tmp2, &r2, &r2);
+                {
+                    TT_BigInt rem5; tt_bigint_init(&rem5,cap);
+                    tt_bigint_zero(&rem5);
+                    {
+                        int k;
+                        TT_BigInt qsh; tt_bigint_init(&qsh,cap);
+                        for(k=tmp2.used*32-1;k>=0;k--){
+                            int wk=k/32,bk=k%32;
+                            tt_u32 b2=(tmp2.d[wk]>>bk)&1u;
+                            tt_bigint_shl(&qsh,&rem5,1);
+                            tt_bigint_copy(&rem5,&qsh);
+                            if(b2){rem5.d[0]|=1;if(!rem5.used)rem5.used=1;}
+                            if(tt_bigint_cmp_mag(&rem5,n)>=0) tt__bigint_sub_mag(&rem5,&rem5,n);
+                        }
+                        tt_bigint_free(&qsh);
+                    }
+                    tt_bigint_copy(&r2,&rem5);
+                    tt_bigint_free(&rem5);
+                }
+                if (r2.used==1&&r2.d[0]==1) { composite=1; break; }
+                if (tt_bigint_cmp_mag(&r2,&nm1)==0) { composite=0; break; }
+            }
+            if (composite) {
+                tt_bigint_free(&nm1); tt_bigint_free(&d2);
+                tt_bigint_free(&r2);  tt_bigint_free(&w2);
+                tt_bigint_free(&tmp2);
+                return 0;
+            }
+        }
+    }
+    tt_bigint_free(&nm1); tt_bigint_free(&d2);
+    tt_bigint_free(&r2);  tt_bigint_free(&w2);
+    tt_bigint_free(&tmp2);
+    return 1;
+}
+
+TT_INLINE void tt_bigint_isqrt(TT_BigInt *r, const TT_BigInt *n, int cap) {
+    TT_BigInt x, y, tmp3;
+    tt_bigint_init(&x, cap); tt_bigint_init(&y, cap); tt_bigint_init(&tmp3, cap);
+    if (tt_bigint_is_zero(n)) { tt_bigint_zero(r); goto done_isqrt; }
+    tt_bigint_copy(&x, n);
+    for (;;) {
+        TT_BigInt qd; tt_bigint_init(&qd, cap);
+        {
+            tt_bigint_zero(&qd);
+            TT_BigInt rem6; tt_bigint_init(&rem6, cap);
+            tt_bigint_zero(&rem6);
+            {
+                int k;
+                TT_BigInt qsh2; tt_bigint_init(&qsh2, cap);
+                for(k=n->used*32-1;k>=0;k--){
+                    int wk=k/32,bk=k%32;
+                    tt_u32 b3=(n->d[wk]>>bk)&1u;
+                    tt_bigint_shl(&qsh2,&rem6,1);
+                    tt_bigint_copy(&rem6,&qsh2);
+                    if(b3){rem6.d[0]|=1;if(!rem6.used)rem6.used=1;}
+                    if(tt_bigint_cmp_mag(&rem6,&x)>=0){
+                        tt__bigint_sub_mag(&rem6,&rem6,&x);
+                        qd.d[k/32]|=(1u<<(k%32));
+                        if(k/32>=qd.used) qd.used=k/32+1;
+                    }
+                }
+                tt_bigint_free(&qsh2);
+            }
+            tt_bigint_free(&rem6);
+        }
+        tt__bigint_add_mag(&y, &x, &qd);
+        tt_bigint_shr(&tmp3, &y, 1);         
+        tt_bigint_free(&qd);
+        if (tt_bigint_cmp_mag(&tmp3, &x) >= 0) break;
+        tt_bigint_copy(&x, &tmp3);
+    }
+    tt_bigint_copy(r, &x);
+done_isqrt:
+    tt_bigint_free(&x); tt_bigint_free(&y); tt_bigint_free(&tmp3);
+}
+
+TT_INLINE void tt_bigint_fib(TT_BigInt *r, int n, int cap) {
+    TT_BigInt a2, b2, tmp4;
+    int i;
+    tt_bigint_init(&a2, cap); tt_bigint_init(&b2, cap); tt_bigint_init(&tmp4, cap);
+    tt_bigint_set_u32(&a2, 0); tt_bigint_set_u32(&b2, 1);
+    if (n == 0) { tt_bigint_copy(r, &a2); goto fib_done; }
+    if (n == 1) { tt_bigint_copy(r, &b2); goto fib_done; }
+    for (i = 2; i <= n; i++) {
+        tt__bigint_add_mag(&tmp4, &a2, &b2);
+        tt_bigint_copy(&a2, &b2);
+        tt_bigint_copy(&b2, &tmp4);
+    }
+    tt_bigint_copy(r, &b2);
+fib_done:
+    tt_bigint_free(&a2); tt_bigint_free(&b2); tt_bigint_free(&tmp4);
+}
+
+TT_INLINE void tt_bigint_factorial(TT_BigInt *r, int n, int cap) {
+    TT_BigInt tmp5;
+    int i;
+    tt_bigint_init(&tmp5, cap);
+    tt_bigint_set_u32(r, 1);
+    for (i = 2; i <= n; i++) {
+        tt_bigint_mul_u32(&tmp5, r, (tt_u32)i);
+        tt_bigint_copy(r, &tmp5);
+    }
+    tt_bigint_free(&tmp5);
+}
+
+
+#define TT_FP_MODES 31
+static const int TT_FP_MODE_FRAC_BITS[TT_FP_MODES] = {
+    2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024, 2048, 4096,
+    8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576,
+    2097152, 4194304, 8388608, 16777216, 33554432, 67108864,
+    134217728, 268435456, 536870912, 1073741824
+};
+static const char *TT_FP_MODE_NAMES[TT_FP_MODES] TT_UNUSED = {
+    "Q2.2",       "Q4.4",        "Q8.8",         "Q16.16",
+    "Q24.24",     "Q32.32",      "Q64.64",        "Q128.128",
+    "Q256.256",   "Q512.512",    "Q1024.1024",    "Q2048.2048",
+    "Q4096.4096", "Q8192.8192",  "Q16384.16384",  "Q32768.32768",
+    "Q65536.65536","Q131072.131072","Q262144.262144","Q524288.524288",
+    "Q1048576.1048576","Q2097152.2097152","Q4194304.4194304",
+    "Q8388608.8388608","Q16777216.16777216","Q33554432.33554432",
+    "Q67108864.67108864","Q134217728.134217728","Q268435456.268435456",
+    "Q536870912.536870912","Q1073741824.1073741824"
+};
+
+typedef struct {
+    TT_BigInt mag;                             
+    int       sign;                 
+    int       fb;                          
+} TT_Fixed;
+
+TT_INLINE int tt_fp_limbs(int fb) {
+    int total_bits = fb * 2;
+    return (total_bits + 31) / 32 + 2;                      
+}
+
+TT_INLINE int tt_fp_init(TT_Fixed *n, int fb) {
+    n->fb   = fb;
+    n->sign = 1;
+    return tt_bigint_init(&n->mag, tt_fp_limbs(fb));
+}
+
+TT_INLINE void tt_fp_free(TT_Fixed *n) { tt_bigint_free(&n->mag); }
+
+TT_INLINE void tt_fp_zero(TT_Fixed *n) { tt_bigint_zero(&n->mag); n->sign = 1; }
+
+TT_INLINE void tt_fp_copy(TT_Fixed *dst, const TT_Fixed *src) {
+    tt_bigint_copy(&dst->mag, &src->mag);
+    dst->sign = src->sign;
+    dst->fb   = src->fb;
+}
+
+TT_INLINE void tt_fp_from_dec(TT_Fixed *out, const char *s) {
+    int i;
+    const char *dot, *frac_s;
+    int il, fl;
+    TT_BigInt ten, acc, tmp6, dig, int_fp, frac_acc;
+    int cap = out->mag.len;
+
+    tt_fp_zero(out);
+    if (*s == '-') { out->sign = -1; s++; }
+    else { out->sign = 1; if (*s == '+') s++; }
+
+    dot    = strchr(s, '.');
+    il     = dot ? (int)(dot - s) : (int)strlen(s);
+    frac_s = dot ? dot + 1 : "";
+    fl     = (int)strlen(frac_s);
+    { int max_fl = (out->fb * 3010LL / 100000) + 4; if (fl > max_fl) fl = max_fl; }
+
+    tt_bigint_init(&ten, cap); tt_bigint_init(&acc, cap);
+    tt_bigint_init(&tmp6,cap); tt_bigint_init(&dig, cap);
+    tt_bigint_init(&int_fp,  cap);
+    tt_bigint_init(&frac_acc,cap);
+    tt_bigint_set_u32(&ten, 10);
+
+    for (i = 0; i < il; i++) {
+        if (!isdigit((unsigned char)s[i])) continue;
+        tt_bigint_mul_u32(&tmp6, &acc, 10);
+        tt_bigint_copy(&acc, &tmp6);
+        acc.d[0] += (tt_u32)(s[i] - '0');
+        if (!acc.used) acc.used = 1;
+        tt_bigint_norm(&acc);
+    }
+    tt_bigint_shl(&int_fp, &acc, out->fb);
+
+    if (fl > 0) {
+        TT_BigInt N6, D6, N_shifted, q6, rem7, power10;
+        tt_bigint_init(&N6,       cap*2); tt_bigint_init(&D6,       cap*2);
+        tt_bigint_init(&N_shifted,cap*2); tt_bigint_init(&q6,       cap*2);
+        tt_bigint_init(&rem7,     cap*2); tt_bigint_init(&power10,  cap*2);
+        tt_bigint_zero(&N6); tt_bigint_set_u32(&D6, 1);
+        for (i = 0; i < fl; i++) {
+            if (!isdigit((unsigned char)frac_s[i])) continue;
+            tt_bigint_mul_u32(&q6, &N6, 10); tt_bigint_copy(&N6, &q6);
+            N6.d[0] += (tt_u32)(frac_s[i]-'0'); if(!N6.used) N6.used=1; tt_bigint_norm(&N6);
+            tt_bigint_mul_u32(&q6, &D6, 10); tt_bigint_copy(&D6, &q6);
+        }
+        tt_bigint_shl(&N_shifted, &N6, out->fb);
+        tt_bigint_zero(&frac_acc); tt_bigint_zero(&rem7);
+        {
+            int k;
+            for (k = N_shifted.used*32-1; k >= 0; k--) {
+                int wk=k/32, bk=k%32;
+                tt_u32 b4 = (N_shifted.d[wk]>>bk)&1u;
+                tt_bigint_shl(&q6,&rem7,1); tt_bigint_copy(&rem7,&q6);
+                if(b4){rem7.d[0]|=1;if(!rem7.used)rem7.used=1;}
+                if(tt_bigint_cmp_mag(&rem7,&D6)>=0){
+                    tt__bigint_sub_mag(&rem7,&rem7,&D6);
+                    if(k/32 < frac_acc.len){
+                        frac_acc.d[k/32] |= (1u<<(k%32));
+                        if(k/32 >= frac_acc.used) frac_acc.used = k/32+1;
+                    }
+                }
+            }
+        }
+        tt_bigint_free(&N6); tt_bigint_free(&D6);
+        tt_bigint_free(&N_shifted); tt_bigint_free(&q6);
+        tt_bigint_free(&rem7); tt_bigint_free(&power10);
+    }
+
+    tt__bigint_add_mag(&out->mag, &int_fp, &frac_acc);
+    tt_bigint_norm(&out->mag);
+
+    tt_bigint_free(&ten); tt_bigint_free(&acc); tt_bigint_free(&tmp6);
+    tt_bigint_free(&dig); tt_bigint_free(&int_fp); tt_bigint_free(&frac_acc);
+    if (tt_bigint_is_zero(&out->mag)) out->sign = 1;
+}
+
+TT_INLINE void tt_fp_to_dec(const TT_Fixed *n, char *buf, int bufsz) {
+    int fb  = n->fb;
+    int cap = n->mag.len;
+    TT_BigInt int_part, frac_part, fp_cur, prod, dval, q8, tmp8;
+    char ibuf[3200], fbuf[3200];
+    int ilen=0, flen=0, max_fd, pos=0, i;
+
+    tt_bigint_init(&int_part, cap); tt_bigint_init(&frac_part, cap);
+    tt_bigint_init(&fp_cur,   cap); tt_bigint_init(&prod,      cap);
+    tt_bigint_init(&dval,     cap); tt_bigint_init(&q8,        cap);
+    tt_bigint_init(&tmp8,     cap);
+
+    tt_bigint_shr(&int_part, &n->mag, fb);
+
+    tt_bigint_copy(&frac_part, &n->mag);
+    {
+        int w = fb / 32, b5 = fb % 32, k;
+        for (k = w+1; k < frac_part.used && k < cap; k++) frac_part.d[k] = 0;
+        if (w < cap && b5) frac_part.d[w] &= (1u<<b5)-1u;
+        if (w < cap && b5==0) frac_part.d[w] = 0;
+        tt_bigint_norm(&frac_part);
+    }
+
+    if (tt_bigint_is_zero(&int_part)) {
+        ibuf[ilen++] = '0';
+    } else {
+        tt_bigint_copy(&tmp8, &int_part);
+        while (!tt_bigint_is_zero(&tmp8) && ilen < 3199) {
+            tt_u32 rem8 = tt_bigint_div_u32(&q8, &tmp8, 10);
+            ibuf[ilen++] = (char)('0' + rem8);
+            tt_bigint_copy(&tmp8, &q8);
+        }
+        for (i=0,pos=ilen-1; i<pos; i++,pos--) { char c2=ibuf[i]; ibuf[i]=ibuf[pos]; ibuf[pos]=c2; }
+        pos = 0;
+    }
+    ibuf[ilen] = '\0';
+
+    max_fd = (int)((long)fb * 3010 / 100000) + 4;
+    if (max_fd > 1300) max_fd = 1300;
+    tt_bigint_copy(&fp_cur, &frac_part);
+    for (i = 0; i < max_fd && !tt_bigint_is_zero(&fp_cur) && flen < 3199; i++) {
+        tt_bigint_mul_u32(&prod, &fp_cur, 10);
+        tt_bigint_shr(&dval, &prod, fb);
+        fbuf[flen++] = (char)('0' + (dval.used ? dval.d[0]&0xF : 0));
+        tt_bigint_copy(&fp_cur, &prod);
+        {
+            int w2 = fb/32, b6 = fb%32, k;
+            for (k = w2+1; k < fp_cur.used && k < cap; k++) fp_cur.d[k] = 0;
+            if (w2 < cap && b6) fp_cur.d[w2] &= (1u<<b6)-1u;
+            if (w2 < cap && b6==0) fp_cur.d[w2] = 0;
+            tt_bigint_norm(&fp_cur);
+        }
+    }
+    while (flen > 1 && fbuf[flen-1] == '0') flen--;
+    fbuf[flen] = '\0';
+
+    pos = 0;
+    if (n->sign == -1 && !tt_bigint_is_zero(&n->mag) && pos < bufsz-1)
+        buf[pos++] = '-';
+    for (i = 0; i < ilen && pos < bufsz-1; i++) buf[pos++] = ibuf[i];
+    if (flen > 0) {
+        if (pos < bufsz-1) buf[pos++] = '.';
+        for (i = 0; i < flen && pos < bufsz-1; i++) buf[pos++] = fbuf[i];
+    }
+    buf[pos] = '\0';
+
+    tt_bigint_free(&int_part); tt_bigint_free(&frac_part);
+    tt_bigint_free(&fp_cur);   tt_bigint_free(&prod);
+    tt_bigint_free(&dval);     tt_bigint_free(&q8);
+    tt_bigint_free(&tmp8);
+}
+
+TT_INLINE void tt_fp_add(TT_Fixed *r, const TT_Fixed *a, const TT_Fixed *b) {
+    tt_fp_zero(r);
+    r->fb = a->fb;
+    if (a->sign == b->sign) {
+        tt__bigint_add_mag(&r->mag, &a->mag, &b->mag);
+        r->sign = a->sign;
+    } else {
+        int c = tt_bigint_cmp_mag(&a->mag, &b->mag);
+        if (c == 0) { r->sign = 1; }
+        else if (c > 0) { tt__bigint_sub_mag(&r->mag, &a->mag, &b->mag); r->sign = a->sign; }
+        else            { tt__bigint_sub_mag(&r->mag, &b->mag, &a->mag); r->sign = b->sign; }
+    }
+    tt_bigint_norm(&r->mag);
+    if (tt_bigint_is_zero(&r->mag)) r->sign = 1;
+}
+
+TT_INLINE void tt_fp_sub(TT_Fixed *r, const TT_Fixed *a, const TT_Fixed *b) {
+    TT_Fixed nb;
+    tt_fp_init(&nb, b->fb);
+    tt_fp_copy(&nb, b); nb.sign = -b->sign;
+    tt_fp_add(r, a, &nb);
+    tt_fp_free(&nb);
+}
+
+TT_INLINE void tt_fp_mul(TT_Fixed *r, const TT_Fixed *a, const TT_Fixed *b) {
+    int cap2 = a->mag.len * 2 + 4;
+    TT_BigInt prod2;
+    tt_fp_zero(r); r->fb = a->fb;
+    tt_bigint_init(&prod2, cap2);
+    tt_bigint_mul(&prod2, &a->mag, &b->mag);
+    tt_bigint_shr(&r->mag, &prod2, a->fb);
+    tt_bigint_norm(&r->mag);
+    r->sign = a->sign * b->sign;
+    if (tt_bigint_is_zero(&r->mag)) r->sign = 1;
+    tt_bigint_free(&prod2);
+}
+
+TT_INLINE int tt_fp_div(TT_Fixed *r, const TT_Fixed *a, const TT_Fixed *b) {
+    int cap2 = a->mag.len * 2 + 4;
+    TT_BigInt num_sh, q9, rem9;
+    int k;
+    if (tt_bigint_is_zero(&b->mag)) return -1;                  
+    tt_fp_zero(r); r->fb = a->fb;
+    tt_bigint_init(&num_sh, cap2);
+    tt_bigint_init(&q9,     cap2);
+    tt_bigint_init(&rem9,   cap2);
+    tt_bigint_shl(&num_sh, &a->mag, a->fb);
+    tt_bigint_zero(&q9); tt_bigint_zero(&rem9);
+    for (k = num_sh.used*32-1; k >= 0; k--) {
+        int wk=k/32, bk=k%32;
+        tt_u32 bit5=(num_sh.d[wk]>>bk)&1u;
+        tt_bigint_shl(&q9, &rem9, 1); tt_bigint_copy(&rem9, &q9);
+        if(bit5){rem9.d[0]|=1;if(!rem9.used)rem9.used=1;}
+        if(tt_bigint_cmp_mag(&rem9,&b->mag)>=0){
+            tt__bigint_sub_mag(&rem9,&rem9,&b->mag);
+            if(k/32 < r->mag.len){
+                r->mag.d[k/32] |= (1u<<(k%32));
+                if(k/32 >= r->mag.used) r->mag.used = k/32+1;
+            }
+        }
+    }
+    tt_bigint_norm(&r->mag);
+    r->sign = a->sign * b->sign;
+    if (tt_bigint_is_zero(&r->mag)) r->sign = 1;
+    tt_bigint_free(&num_sh); tt_bigint_free(&q9); tt_bigint_free(&rem9);
+    return 0;
+}
+
+TT_INLINE void tt_fp_pow_int(TT_Fixed *r, const TT_Fixed *a, int exp) {
+    TT_Fixed base9, tmp9;
+    int fb9 = a->fb;
+    tt_fp_init(&base9, fb9); tt_fp_init(&tmp9, fb9);
+    tt_fp_copy(&base9, a);
+    tt_fp_zero(r); r->fb = fb9;
+    tt_bigint_zero(&r->mag);
+    { int w9=fb9/32, b7=fb9%32;
+      if(w9 < r->mag.len){ r->mag.d[w9] |= b7 ? (1u<<b7) : 1u; r->mag.used = w9+1; }
+    }
+    while (exp > 0) {
+        if (exp & 1) { tt_fp_mul(&tmp9, r, &base9); tt_fp_copy(r, &tmp9); }
+        tt_fp_mul(&tmp9, &base9, &base9); tt_fp_copy(&base9, &tmp9);
+        exp >>= 1;
+    }
+    tt_fp_free(&base9); tt_fp_free(&tmp9);
+}
+
+
+#define TT_EXPR_MAX_TOKENS 256
+#define TT_EXPR_NUM_LEN    2048
+
+typedef enum {
+    TT_TOK_NUM, TT_TOK_OP, TT_TOK_LPAREN, TT_TOK_RPAREN, TT_TOK_END
+} TT_TokType;
+
+typedef struct {
+    TT_TokType type;
+    char       num_str[TT_EXPR_NUM_LEN];
+    char       op_ch;
+    int        prec;
+    int        rtl;                          
+} TT_Token;
+
+static TT_Token tt__tokenize(const char *expr, int *idx) {
+    TT_Token tok;
+    memset(&tok, 0, sizeof(tok));
+    while (isspace((unsigned char)expr[*idx])) (*idx)++;
+    if (!expr[*idx])           { tok.type = TT_TOK_END;    return tok; }
+    if (expr[*idx] == '(')     { (*idx)++; tok.type = TT_TOK_LPAREN; return tok; }
+    if (expr[*idx] == ')')     { (*idx)++; tok.type = TT_TOK_RPAREN; return tok; }
+    {
+        int unary_minus = 0;
+        if ((expr[*idx]=='-'||expr[*idx]=='+') &&
+            (isdigit((unsigned char)expr[*idx+1])||expr[*idx+1]=='.')) {
+            int prev = *idx - 1;
+            while (prev >= 0 && isspace((unsigned char)expr[prev])) prev--;
+            if (prev<0||expr[prev]=='('||strchr("+-*/^",expr[prev])) {
+                if (expr[*idx] == '-') unary_minus = 1;
+                (*idx)++;
+            }
+        }
+        if (isdigit((unsigned char)expr[*idx]) || expr[*idx] == '.') {
+            int i = 0;
+            tok.type = TT_TOK_NUM;
+            if (unary_minus && i < TT_EXPR_NUM_LEN-1) tok.num_str[i++] = '-';
+            {
+                int has_dot = 0;
+                while (i < TT_EXPR_NUM_LEN-1 &&
+                       (isdigit((unsigned char)expr[*idx]) ||
+                        (!has_dot && expr[*idx]=='.'))) {
+                    if (expr[*idx]=='.') has_dot=1;
+                    tok.num_str[i++] = expr[(*idx)++];
+                }
+            }
+            tok.num_str[i] = '\0';
+            return tok;
+        }
+    }
+    if (strchr("+-*/^", expr[*idx])) {
+        tok.type  = TT_TOK_OP;
+        tok.op_ch = expr[(*idx)++];
+        if      (tok.op_ch=='+' || tok.op_ch=='-') { tok.prec=2; tok.rtl=0; }
+        else if (tok.op_ch=='*' || tok.op_ch=='/') { tok.prec=3; tok.rtl=0; }
+        else                                        { tok.prec=4; tok.rtl=1; }
+        return tok;
+    }
+    (*idx)++;
+    return tt__tokenize(expr, idx);                        
+}
+
+TT_INLINE int tt_expr_to_rpn(const char *expr, TT_Token *rpn, int max_rpn) {
+    TT_Token ops[64];
+    int op_top = 0, rpn_len = 0, idx = 0;
+    for (;;) {
+        TT_Token tok = tt__tokenize(expr, &idx);
+        if (tok.type == TT_TOK_END) break;
+        if (tok.type == TT_TOK_NUM) {
+            if (rpn_len < max_rpn) rpn[rpn_len++] = tok;
+        } else if (tok.type == TT_TOK_LPAREN) {
+            if (op_top < 64) ops[op_top++] = tok;
+        } else if (tok.type == TT_TOK_RPAREN) {
+            while (op_top>0 && ops[op_top-1].type!=TT_TOK_LPAREN)
+                if (rpn_len<max_rpn) rpn[rpn_len++] = ops[--op_top];
+            if (op_top>0) op_top--;
+        } else if (tok.type == TT_TOK_OP) {
+            while (op_top>0 && ops[op_top-1].type==TT_TOK_OP) {
+                TT_Token top = ops[op_top-1];
+                if ((!tok.rtl && tok.prec<=top.prec)||(tok.rtl && tok.prec<top.prec))
+                    { if(rpn_len<max_rpn) rpn[rpn_len++]=ops[--op_top]; }
+                else break;
+            }
+            if (op_top<64) ops[op_top++]=tok;
+        }
+    }
+    while (op_top>0 && rpn_len<max_rpn) rpn[rpn_len++]=ops[--op_top];
+    return rpn_len;
+}
+
+TT_INLINE int tt_expr_eval_fp(const TT_Token *rpn, int len,
+                                int fb, TT_Fixed *result) {
+    TT_Fixed stack[32];
+    int top = 0, i;
+    for (i = 0; i < len; i++) {
+        if (rpn[i].type == TT_TOK_NUM) {
+            if (top >= 32) return -1;
+            tt_fp_init(&stack[top], fb);
+            tt_fp_from_dec(&stack[top], rpn[i].num_str);
+            top++;
+        } else {
+            TT_Fixed a2, b2;
+            if (top < 2) return -2;
+            b2 = stack[--top];
+            a2 = stack[--top];
+            tt_fp_init(&stack[top], fb);
+            switch (rpn[i].op_ch) {
+                case '+': tt_fp_add(&stack[top], &a2, &b2); break;
+                case '-': tt_fp_sub(&stack[top], &a2, &b2); break;
+                case '*': tt_fp_mul(&stack[top], &a2, &b2); break;
+                case '/':
+                    if (tt_fp_div(&stack[top], &a2, &b2) != 0) {
+                        tt_fp_free(&a2); tt_fp_free(&b2); return -3;
+                    }
+                    break;
+                case '^': {
+                    char ibuf2[32];
+                    TT_BigInt exp_mag;
+                    tt_bigint_init(&exp_mag, 4);
+                    tt_bigint_shr(&exp_mag, &b2.mag, fb);
+                    tt_bigint_to_dec(&exp_mag, ibuf2, sizeof(ibuf2));
+                    { int exp_v = tt_atoi_safe(ibuf2, 0);
+                      tt_fp_pow_int(&stack[top], &a2, exp_v); }
+                    tt_bigint_free(&exp_mag);
+                    break;
+                }
+            }
+            tt_fp_free(&a2); tt_fp_free(&b2);
+            top++;
+        }
+    }
+    if (top != 1) return -4;
+    tt_fp_copy(result, &stack[0]);
+    tt_fp_free(&stack[0]);
+    return 0;
+}
+
+TT_INLINE int tt_expr_eval(const char *expr, int mode, char *buf, int bufsz) {
+    TT_Token rpn[TT_EXPR_MAX_TOKENS];
+    TT_Fixed result;
+    int rpn_len, fb, rc;
+    if (mode < 0 || mode >= TT_FP_MODES) return -1;
+    fb      = TT_FP_MODE_FRAC_BITS[mode];
+    rpn_len = tt_expr_to_rpn(expr, rpn, TT_EXPR_MAX_TOKENS);
+    tt_fp_init(&result, fb);
+    rc = tt_expr_eval_fp(rpn, rpn_len, fb, &result);
+    if (rc == 0) tt_fp_to_dec(&result, buf, bufsz);
+    else         tt_snprintf(buf, (size_t)bufsz, "<error:%d>", rc);
+    tt_fp_free(&result);
+    return rc;
+}
+
+
+typedef struct { int value; int has_value; } TT_OptInt;
+TT_INLINE TT_OptInt tt_some_int(int v) { TT_OptInt o; o.value=v; o.has_value=1; return o; }
+TT_INLINE TT_OptInt tt_none_int(void)  { TT_OptInt o; o.value=0; o.has_value=0; return o; }
+
+typedef struct { double value; int has_value; } TT_OptDbl;
+TT_INLINE TT_OptDbl tt_some_dbl(double v) { TT_OptDbl o; o.value=v; o.has_value=1; return o; }
+TT_INLINE TT_OptDbl tt_none_dbl(void)     { TT_OptDbl o; o.value=0.0; o.has_value=0; return o; }
+
+typedef struct { void *ptr; int has_value; } TT_OptPtr;
+TT_INLINE TT_OptPtr tt_some_ptr(void *p) { TT_OptPtr o; o.ptr=p; o.has_value=1; return o; }
+TT_INLINE TT_OptPtr tt_none_ptr(void)    { TT_OptPtr o; o.ptr=NULL; o.has_value=0; return o; }
+
+typedef struct { void *value; int err; int ok; } TT_Result;
+TT_INLINE TT_Result tt_ok(void *v)  { TT_Result r; r.value=v; r.err=0; r.ok=1; return r; }
+TT_INLINE TT_Result tt_err(int e)   { TT_Result r; r.value=NULL; r.err=e; r.ok=0; return r; }
+
+
+typedef void (*TT_DeferFn)(void*);
+typedef struct { TT_DeferFn fn; void *arg; } TT_DeferEntry;
+
+#define TT_DEFER_STACK_SIZE 32
+typedef struct { TT_DeferEntry e[TT_DEFER_STACK_SIZE]; int top; } TT_DeferStack;
+
+TT_INLINE void tt_defer_init(TT_DeferStack *s) { s->top = 0; }
+TT_INLINE void tt_defer_push(TT_DeferStack *s, TT_DeferFn fn, void *arg) {
+    if (s->top < TT_DEFER_STACK_SIZE) { s->e[s->top].fn=fn; s->e[s->top].arg=arg; s->top++; }
+}
+TT_INLINE void tt_defer_run(TT_DeferStack *s) {
+    while (s->top > 0) { s->top--; s->e[s->top].fn(s->e[s->top].arg); }
+}
+
+#define TT_DEFER_BEGIN     TT_DeferStack _tt_ds_; tt_defer_init(&_tt_ds_);
+#define TT_DEFER(fn, arg)  tt_defer_push(&_tt_ds_, (TT_DeferFn)(fn), (arg))
+#define TT_DEFER_END       tt_defer_run(&_tt_ds_);
+
+
+#define TT_BITSET_WORDS(n) (((n) + 31) / 32)
+
+typedef struct { tt_u32 *words; int nbits; } TT_Bitset;
+
+TT_INLINE int  tt_bitset_init(TT_Bitset *b, int nbits) {
+    b->nbits = nbits;
+    b->words = (tt_u32*)calloc((size_t)TT_BITSET_WORDS(nbits), sizeof(tt_u32));
+    return b->words != NULL;
+}
+TT_INLINE void tt_bitset_free(TT_Bitset *b)  { free(b->words); b->words=NULL; }
+TT_INLINE void tt_bitset_set(TT_Bitset *b, int i)   { b->words[i/32] |=  (1u<<(i%32)); }
+TT_INLINE void tt_bitset_clr(TT_Bitset *b, int i)   { b->words[i/32] &= ~(1u<<(i%32)); }
+TT_INLINE void tt_bitset_flip(TT_Bitset *b, int i)  { b->words[i/32] ^=  (1u<<(i%32)); }
+TT_INLINE int  tt_bitset_get(const TT_Bitset *b, int i) { return (b->words[i/32] >> (i%32)) & 1; }
+TT_INLINE void tt_bitset_clear_all(TT_Bitset *b) { memset(b->words, 0, (size_t)TT_BITSET_WORDS(b->nbits)*4); }
+TT_INLINE void tt_bitset_set_all(TT_Bitset *b)   { memset(b->words, 0xFF, (size_t)TT_BITSET_WORDS(b->nbits)*4); }
+TT_INLINE int  tt_bitset_count(const TT_Bitset *b) {
+    int c=0, i;
+    for (i=0; i<TT_BITSET_WORDS(b->nbits); i++) {
+        tt_u32 v = b->words[i];
+        while (v) { c += v&1; v>>=1; }
+    }
+    return c;
+}
+TT_INLINE void tt_bitset_and(TT_Bitset *r, const TT_Bitset *a, const TT_Bitset *b) {
+    int i; for (i=0;i<TT_BITSET_WORDS(r->nbits);i++) r->words[i]=a->words[i]&b->words[i];
+}
+TT_INLINE void tt_bitset_or(TT_Bitset *r, const TT_Bitset *a, const TT_Bitset *b) {
+    int i; for (i=0;i<TT_BITSET_WORDS(r->nbits);i++) r->words[i]=a->words[i]|b->words[i];
+}
+TT_INLINE void tt_bitset_xor(TT_Bitset *r, const TT_Bitset *a, const TT_Bitset *b) {
+    int i; for (i=0;i<TT_BITSET_WORDS(r->nbits);i++) r->words[i]=a->words[i]^b->words[i];
+}
+TT_INLINE int tt_bitset_any(const TT_Bitset *b) {
+    int i; for (i=0;i<TT_BITSET_WORDS(b->nbits);i++) if(b->words[i]) return 1; return 0;
+}
+TT_INLINE int tt_bitset_none(const TT_Bitset *b) { return !tt_bitset_any(b); }
+
+
+#define TT_MAT_MAX 16
+typedef struct { double m[TT_MAT_MAX][TT_MAT_MAX]; int rows, cols; } TT_Mat;
+
+TT_INLINE void tt_mat_zero(TT_Mat *M, int rows, int cols) {
+    memset(M->m, 0, sizeof(M->m)); M->rows=rows; M->cols=cols;
+}
+TT_INLINE void tt_mat_identity(TT_Mat *M, int n) {
+    int i; tt_mat_zero(M, n, n);
+    for (i=0;i<n;i++) M->m[i][i]=1.0;
+}
+TT_INLINE void tt_mat_add(TT_Mat *R, const TT_Mat *A, const TT_Mat *B) {
+    int i,j; R->rows=A->rows; R->cols=A->cols;
+    for (i=0;i<A->rows;i++) for (j=0;j<A->cols;j++) R->m[i][j]=A->m[i][j]+B->m[i][j];
+}
+TT_INLINE void tt_mat_sub(TT_Mat *R, const TT_Mat *A, const TT_Mat *B) {
+    int i,j; R->rows=A->rows; R->cols=A->cols;
+    for (i=0;i<A->rows;i++) for (j=0;j<A->cols;j++) R->m[i][j]=A->m[i][j]-B->m[i][j];
+}
+TT_INLINE void tt_mat_mul(TT_Mat *R, const TT_Mat *A, const TT_Mat *B) {
+    int i,j,k; TT_Mat tmp; tt_mat_zero(&tmp, A->rows, B->cols);
+    for (i=0;i<A->rows;i++) for (j=0;j<B->cols;j++) for (k=0;k<A->cols;k++)
+        tmp.m[i][j] += A->m[i][k]*B->m[k][j];
+    *R = tmp;
+}
+TT_INLINE void tt_mat_scale(TT_Mat *R, const TT_Mat *A, double s) {
+    int i,j; *R=*A;
+    for (i=0;i<A->rows;i++) for (j=0;j<A->cols;j++) R->m[i][j]*=s;
+}
+TT_INLINE void tt_mat_transpose(TT_Mat *R, const TT_Mat *A) {
+    int i,j; TT_Mat tmp; tt_mat_zero(&tmp, A->cols, A->rows);
+    for (i=0;i<A->rows;i++) for (j=0;j<A->cols;j++) tmp.m[j][i]=A->m[i][j];
+    *R=tmp;
+}
+TT_INLINE double tt_mat_lu(TT_Mat *A, int *piv) {
+    int i,j,k,n=A->rows; double det=1.0;
+    for (i=0;i<n;i++) piv[i]=i;
+    for (k=0;k<n;k++) {
+        double mx=0.0; int mx_r=k;
+        for (i=k;i<n;i++) if (fabs(A->m[i][k])>mx){mx=fabs(A->m[i][k]);mx_r=i;}
+        if (mx_r!=k) {
+            for (j=0;j<n;j++){double t=A->m[k][j];A->m[k][j]=A->m[mx_r][j];A->m[mx_r][j]=t;}
+            { int t2=piv[k]; piv[k]=piv[mx_r]; piv[mx_r]=t2; }
+            det=-det;
+        }
+        if (A->m[k][k]==0.0) return 0.0;
+        det*=A->m[k][k];
+        for (i=k+1;i<n;i++) {
+            A->m[i][k]/=A->m[k][k];
+            for (j=k+1;j<n;j++) A->m[i][j]-=A->m[i][k]*A->m[k][j];
+        }
+    }
+    return det;
+}
+TT_INLINE void tt_mat_lu_solve(const TT_Mat *LU, const int *piv, const double *b, double *x, int n) {
+    int i,k; double y[TT_MAT_MAX];
+    for (i=0;i<n;i++){y[i]=b[piv[i]]; for(k=0;k<i;k++) y[i]-=LU->m[i][k]*y[k];}
+    for (i=n-1;i>=0;i--){x[i]=y[i]; for(k=i+1;k<n;k++) x[i]-=LU->m[i][k]*x[k]; x[i]/=LU->m[i][i];}
+}
+TT_INLINE double tt_mat_det(const TT_Mat *A) {
+    TT_Mat tmp=*A; int piv[TT_MAT_MAX]; return tt_mat_lu(&tmp, piv);
+}
+TT_INLINE void tt_mat_print(const TT_Mat *A) {
+    int i,j;
+    for (i=0;i<A->rows;i++){
+        for (j=0;j<A->cols;j++) printf("%10.4f ", A->m[i][j]);
+        printf("\n");
+    }
+}
+
+
+typedef struct { double re, im; } TT_Cplx;
+
+TT_INLINE TT_Cplx tt_cplx(double re, double im) { TT_Cplx c; c.re=re; c.im=im; return c; }
+TT_INLINE TT_Cplx tt_cplx_add(TT_Cplx a, TT_Cplx b) { return tt_cplx(a.re+b.re, a.im+b.im); }
+TT_INLINE TT_Cplx tt_cplx_sub(TT_Cplx a, TT_Cplx b) { return tt_cplx(a.re-b.re, a.im-b.im); }
+TT_INLINE TT_Cplx tt_cplx_mul(TT_Cplx a, TT_Cplx b) { return tt_cplx(a.re*b.re-a.im*b.im, a.re*b.im+a.im*b.re); }
+TT_INLINE TT_Cplx tt_cplx_div(TT_Cplx a, TT_Cplx b) {
+    double d=b.re*b.re+b.im*b.im;
+    return d==0.0 ? tt_cplx(0,0) : tt_cplx((a.re*b.re+a.im*b.im)/d,(a.im*b.re-a.re*b.im)/d);
+}
+TT_INLINE TT_Cplx tt_cplx_conj(TT_Cplx a)  { return tt_cplx(a.re,-a.im); }
+TT_INLINE double  tt_cplx_abs(TT_Cplx a)   { return sqrt(a.re*a.re+a.im*a.im); }
+TT_INLINE double  tt_cplx_arg(TT_Cplx a)   { return atan2(a.im,a.re); }
+TT_INLINE TT_Cplx tt_cplx_exp(TT_Cplx a)   { double e=exp(a.re); return tt_cplx(e*cos(a.im),e*sin(a.im)); }
+TT_INLINE TT_Cplx tt_cplx_log(TT_Cplx a)   { return tt_cplx(log(tt_cplx_abs(a)), tt_cplx_arg(a)); }
+TT_INLINE TT_Cplx tt_cplx_pow(TT_Cplx a, TT_Cplx b) { return tt_cplx_exp(tt_cplx_mul(b, tt_cplx_log(a))); }
+TT_INLINE TT_Cplx tt_cplx_sqrt(TT_Cplx a)  {
+    double r=tt_cplx_abs(a), th=tt_cplx_arg(a);
+    return tt_cplx(sqrt(r)*cos(th/2.0), sqrt(r)*sin(th/2.0));
+}
+TT_INLINE TT_Cplx tt_cplx_from_polar(double r, double th) { return tt_cplx(r*cos(th), r*sin(th)); }
+
+
+typedef struct { double x,y;       } TT_V2;
+typedef struct { double x,y,z;     } TT_V3;
+typedef struct { double x,y,z,w;   } TT_V4;
+
+TT_INLINE TT_V2 tt_v2(double x,double y){TT_V2 v;v.x=x;v.y=y;return v;}
+TT_INLINE TT_V2 tt_v2_add(TT_V2 a,TT_V2 b){return tt_v2(a.x+b.x,a.y+b.y);}
+TT_INLINE TT_V2 tt_v2_sub(TT_V2 a,TT_V2 b){return tt_v2(a.x-b.x,a.y-b.y);}
+TT_INLINE TT_V2 tt_v2_scale(TT_V2 a,double s){return tt_v2(a.x*s,a.y*s);}
+TT_INLINE double tt_v2_dot(TT_V2 a,TT_V2 b){return a.x*b.x+a.y*b.y;}
+TT_INLINE double tt_v2_len(TT_V2 a){return sqrt(a.x*a.x+a.y*a.y);}
+TT_INLINE TT_V2  tt_v2_norm(TT_V2 a){double l=tt_v2_len(a);return l?tt_v2_scale(a,1.0/l):a;}
+TT_INLINE TT_V2  tt_v2_perp(TT_V2 a){return tt_v2(-a.y,a.x);}
+TT_INLINE double tt_v2_cross(TT_V2 a,TT_V2 b){return a.x*b.y-a.y*b.x;}
+TT_INLINE TT_V2  tt_v2_lerp(TT_V2 a,TT_V2 b,double t){return tt_v2(a.x+(b.x-a.x)*t,a.y+(b.y-a.y)*t);}
+TT_INLINE double tt_v2_dist(TT_V2 a,TT_V2 b){return tt_v2_len(tt_v2_sub(b,a));}
+
+TT_INLINE TT_V3 tt_v3(double x,double y,double z){TT_V3 v;v.x=x;v.y=y;v.z=z;return v;}
+TT_INLINE TT_V3 tt_v3_add(TT_V3 a,TT_V3 b){return tt_v3(a.x+b.x,a.y+b.y,a.z+b.z);}
+TT_INLINE TT_V3 tt_v3_sub(TT_V3 a,TT_V3 b){return tt_v3(a.x-b.x,a.y-b.y,a.z-b.z);}
+TT_INLINE TT_V3 tt_v3_scale(TT_V3 a,double s){return tt_v3(a.x*s,a.y*s,a.z*s);}
+TT_INLINE double tt_v3_dot(TT_V3 a,TT_V3 b){return a.x*b.x+a.y*b.y+a.z*b.z;}
+TT_INLINE double tt_v3_len(TT_V3 a){return sqrt(a.x*a.x+a.y*a.y+a.z*a.z);}
+TT_INLINE TT_V3  tt_v3_norm(TT_V3 a){double l=tt_v3_len(a);return l?tt_v3_scale(a,1.0/l):a;}
+TT_INLINE TT_V3  tt_v3_cross(TT_V3 a,TT_V3 b){return tt_v3(a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x);}
+TT_INLINE TT_V3  tt_v3_lerp(TT_V3 a,TT_V3 b,double t){return tt_v3(a.x+(b.x-a.x)*t,a.y+(b.y-a.y)*t,a.z+(b.z-a.z)*t);}
+TT_INLINE double tt_v3_dist(TT_V3 a,TT_V3 b){return tt_v3_len(tt_v3_sub(b,a));}
+TT_INLINE TT_V3  tt_v3_reflect(TT_V3 v,TT_V3 n){return tt_v3_sub(v,tt_v3_scale(n,2.0*tt_v3_dot(v,n)));}
+
+TT_INLINE TT_V4 tt_v4(double x,double y,double z,double w){TT_V4 v;v.x=x;v.y=y;v.z=z;v.w=w;return v;}
+TT_INLINE TT_V4 tt_v4_add(TT_V4 a,TT_V4 b){return tt_v4(a.x+b.x,a.y+b.y,a.z+b.z,a.w+b.w);}
+TT_INLINE double tt_v4_dot(TT_V4 a,TT_V4 b){return a.x*b.x+a.y*b.y+a.z*b.z+a.w*b.w;}
+
+
+typedef struct { double x,y,z,w; } TT_Quat;
+
+TT_INLINE TT_Quat tt_quat(double x,double y,double z,double w){TT_Quat q;q.x=x;q.y=y;q.z=z;q.w=w;return q;}
+TT_INLINE TT_Quat tt_quat_identity(void){return tt_quat(0,0,0,1);}
+TT_INLINE TT_Quat tt_quat_mul(TT_Quat a,TT_Quat b){
+    return tt_quat(
+        a.w*b.x+a.x*b.w+a.y*b.z-a.z*b.y,
+        a.w*b.y-a.x*b.z+a.y*b.w+a.z*b.x,
+        a.w*b.z+a.x*b.y-a.y*b.x+a.z*b.w,
+        a.w*b.w-a.x*b.x-a.y*b.y-a.z*b.z);
+}
+TT_INLINE TT_Quat tt_quat_conj(TT_Quat q){return tt_quat(-q.x,-q.y,-q.z,q.w);}
+TT_INLINE double  tt_quat_len(TT_Quat q){return sqrt(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w);}
+TT_INLINE TT_Quat tt_quat_norm(TT_Quat q){double l=tt_quat_len(q);return l?tt_quat(q.x/l,q.y/l,q.z/l,q.w/l):q;}
+TT_INLINE TT_Quat tt_quat_from_axis_angle(TT_V3 axis, double angle) {
+    double s=sin(angle/2.0);
+    return tt_quat_norm(tt_quat(axis.x*s,axis.y*s,axis.z*s,cos(angle/2.0)));
+}
+TT_INLINE TT_V3   tt_quat_rotate(TT_Quat q, TT_V3 v) {
+    TT_Quat vq=tt_quat(v.x,v.y,v.z,0);
+    TT_Quat r=tt_quat_mul(tt_quat_mul(q,vq),tt_quat_conj(q));
+    return tt_v3(r.x,r.y,r.z);
+}
+TT_INLINE TT_Quat tt_quat_slerp(TT_Quat a, TT_Quat b, double t) {
+    double dot=a.x*b.x+a.y*b.y+a.z*b.z+a.w*b.w;
+    double theta, sinT, sa, sb;
+    if (dot<0){dot=-dot;b=tt_quat(-b.x,-b.y,-b.z,-b.w);}
+    if (dot>0.9995){
+        TT_Quat r=tt_quat(a.x+(b.x-a.x)*t,a.y+(b.y-a.y)*t,a.z+(b.z-a.z)*t,a.w+(b.w-a.w)*t);
+        return tt_quat_norm(r);
+    }
+    theta=acos(dot); sinT=sin(theta);
+    sa=sin((1.0-t)*theta)/sinT; sb=sin(t*theta)/sinT;
+    return tt_quat(a.x*sa+b.x*sb,a.y*sa+b.y*sb,a.z*sa+b.z*sb,a.w*sa+b.w*sb);
+}
+
+
+typedef struct { tt_u8 r,g,b,a; } TT_Color;
+
+TT_INLINE TT_Color tt_rgba(tt_u8 r,tt_u8 g,tt_u8 b,tt_u8 a){TT_Color c;c.r=r;c.g=g;c.b=b;c.a=a;return c;}
+TT_INLINE TT_Color tt_rgb(tt_u8 r,tt_u8 g,tt_u8 b){return tt_rgba(r,g,b,255);}
+TT_INLINE TT_Color tt_color_from_hex(tt_u32 hex){
+    return tt_rgba((tt_u8)((hex>>16)&0xFF),(tt_u8)((hex>>8)&0xFF),(tt_u8)(hex&0xFF),255);
+}
+TT_INLINE tt_u32 tt_color_to_hex(TT_Color c){return ((tt_u32)c.r<<16)|((tt_u32)c.g<<8)|c.b;}
+TT_INLINE TT_Color tt_color_lerp(TT_Color a, TT_Color b, double t) {
+    return tt_rgba(
+        (tt_u8)(a.r+(b.r-a.r)*t), (tt_u8)(a.g+(b.g-a.g)*t),
+        (tt_u8)(a.b+(b.b-a.b)*t), (tt_u8)(a.a+(b.a-a.a)*t));
+}
+TT_INLINE TT_Color tt_color_alpha_blend(TT_Color src, TT_Color dst) {
+    double sa=src.a/255.0, da=dst.a/255.0*(1.0-sa);
+    double oa=sa+da;
+    return oa<1e-9 ? tt_rgba(0,0,0,0) :
+        tt_rgba((tt_u8)((src.r*sa+dst.r*da)/oa),
+                (tt_u8)((src.g*sa+dst.g*da)/oa),
+                (tt_u8)((src.b*sa+dst.b*da)/oa),
+                (tt_u8)(oa*255.0));
+}
+#define TT_RED     tt_rgb(255,  0,  0)
+#define TT_GREEN   tt_rgb(  0,255,  0)
+#define TT_BLUE    tt_rgb(  0,  0,255)
+#define TT_WHITE   tt_rgb(255,255,255)
+#define TT_BLACK   tt_rgb(  0,  0,  0)
+#define TT_YELLOW  tt_rgb(255,255,  0)
+#define TT_CYAN    tt_rgb(  0,255,255)
+#define TT_MAGENTA tt_rgb(255,  0,255)
+#define TT_ORANGE  tt_rgb(255,165,  0)
+#define TT_PURPLE  tt_rgb(128,  0,128)
+TT_INLINE int tt_color_to_ansi256(TT_Color c) {
+    if (c.r==c.g && c.g==c.b) {
+        if (c.r<8)   return 16;
+        if (c.r>247) return 231;
+        return (int)((c.r-8)/247.0*24)+232;
+    }
+    return 16 + 36*(c.r/51) + 6*(c.g/51) + (c.b/51);
+}
+
+
+typedef struct {
+    void   *buf;
+    int    *free_list;
+    int     cap;
+    int     block_size;
+    int     head;
+} TT_Pool;
+
+TT_INLINE int tt_pool_init(TT_Pool *p, int cap, int block_size) {
+    int i;
+    p->cap        = cap;
+    p->block_size = block_size;
+    p->buf        = malloc((size_t)cap * (size_t)block_size);
+    p->free_list  = (int*)malloc((size_t)cap * sizeof(int));
+    if (!p->buf || !p->free_list) { free(p->buf); free(p->free_list); return 0; }
+    for (i=0; i<cap; i++) p->free_list[i] = i;
+    p->head = cap - 1;
+    return 1;
+}
+
+TT_INLINE void *tt_pool_alloc(TT_Pool *p) {
+    if (p->head < 0) return NULL;
+    return (tt_u8*)p->buf + (size_t)p->free_list[p->head--] * (size_t)p->block_size;
+}
+
+TT_INLINE void tt_pool_free_ptr(TT_Pool *p, void *ptr) {
+    int idx = (int)(((tt_u8*)ptr - (tt_u8*)p->buf) / (size_t)p->block_size);
+    if (p->head < p->cap - 1) p->free_list[++p->head] = idx;
+}
+
+TT_INLINE void tt_pool_destroy(TT_Pool *p) {
+    free(p->buf); free(p->free_list);
+    p->buf = NULL; p->free_list = NULL;
+}
+
+
+#define TT_TRIE_ALPHA 128            
+
+typedef struct TT_TrieNode {
+    struct TT_TrieNode *children[TT_TRIE_ALPHA];
+    int is_end;
+    void *data;
+} TT_TrieNode;
+
+TT_INLINE TT_TrieNode *tt_trie_new(void) {
+    return (TT_TrieNode*)calloc(1, sizeof(TT_TrieNode));
+}
+
+TT_INLINE void tt_trie_insert(TT_TrieNode *root, const char *key, void *data) {
+    for (; *key; key++) {
+        unsigned char c = (unsigned char)*key % TT_TRIE_ALPHA;
+        if (!root->children[c]) root->children[c] = tt_trie_new();
+        root = root->children[c];
+    }
+    root->is_end = 1; root->data = data;
+}
+
+TT_INLINE TT_TrieNode *tt_trie_search(TT_TrieNode *root, const char *key) {
+    for (; *key; key++) {
+        unsigned char c = (unsigned char)*key % TT_TRIE_ALPHA;
+        if (!root->children[c]) return NULL;
+        root = root->children[c];
+    }
+    return root->is_end ? root : NULL;
+}
+
+TT_INLINE void *tt_trie_get(TT_TrieNode *root, const char *key) {
+    TT_TrieNode *n = tt_trie_search(root, key);
+    return n ? n->data : NULL;
+}
+
+static void tt__trie_free(TT_TrieNode *node) {
+    int i;
+    if (!node) return;
+    for (i=0;i<TT_TRIE_ALPHA;i++) tt__trie_free(node->children[i]);
+    free(node);
+}
+TT_INLINE void tt_trie_free(TT_TrieNode *root) { tt__trie_free(root); }
+
+
+typedef int (*TT_HeapCmp)(const void*, const void*);
+
+typedef struct {
+    void     **data;
+    int        size;
+    int        cap;
+    TT_HeapCmp cmp;
+} TT_Heap;
+
+TT_INLINE int tt_heap_init(TT_Heap *h, int cap, TT_HeapCmp cmp) {
+    h->data = (void**)malloc((size_t)cap * sizeof(void*));
+    h->size = 0; h->cap = cap; h->cmp = cmp;
+    return h->data != NULL;
+}
+TT_INLINE void tt_heap_free(TT_Heap *h) { free(h->data); h->data=NULL; }
+
+TT_INLINE void tt_heap_push(TT_Heap *h, void *item) {
+    int i;
+    if (h->size >= h->cap) {
+        void **p = (void**)realloc(h->data, (size_t)(h->cap*2)*sizeof(void*));
+        if (!p) return;
+        h->data = p; h->cap *= 2;
+    }
+    h->data[h->size++] = item;
+    i = h->size - 1;
+    while (i > 0) {
+        int parent = (i-1)/2;
+        if (h->cmp(h->data[i], h->data[parent]) < 0) {
+            void *t = h->data[i]; h->data[i]=h->data[parent]; h->data[parent]=t;
+            i = parent;
+        } else break;
+    }
+}
+
+TT_INLINE void *tt_heap_pop(TT_Heap *h) {
+    void *top; int i=0;
+    if (!h->size) return NULL;
+    top = h->data[0];
+    h->data[0] = h->data[--h->size];
+    while (1) {
+        int l=2*i+1, r=2*i+2, best=i;
+        if (l<h->size && h->cmp(h->data[l],h->data[best])<0) best=l;
+        if (r<h->size && h->cmp(h->data[r],h->data[best])<0) best=r;
+        if (best==i) break;
+        { void *t=h->data[i]; h->data[i]=h->data[best]; h->data[best]=t; }
+        i=best;
+    }
+    return top;
+}
+
+TT_INLINE void *tt_heap_peek(const TT_Heap *h) { return h->size ? h->data[0] : NULL; }
+
+
+TT_INLINE void tt_isort(void *base, int n, int size, int (*cmp)(const void*,const void*)) {
+    int i,j;
+    char *b = (char*)base;
+    char *tmp = (char*)malloc((size_t)size);
+    if (!tmp) return;
+    for (i=1;i<n;i++) {
+        memcpy(tmp, b+i*size, (size_t)size);
+        for (j=i-1; j>=0 && cmp(b+j*size,tmp)>0; j--)
+            memcpy(b+(j+1)*size, b+j*size, (size_t)size);
+        memcpy(b+(j+1)*size, tmp, (size_t)size);
+    }
+    free(tmp);
+}
+
+TT_INLINE int tt_bsearch(const void *key, const void *base, int n, int size,
+                          int (*cmp)(const void*,const void*)) {
+    int lo=0, hi=n-1;
+    const char *b = (const char*)base;
+    while (lo<=hi) {
+        int mid=(lo+hi)/2;
+        int c=cmp(key, b+mid*size);
+        if (c==0) return mid;
+        if (c<0)  hi=mid-1;
+        else      lo=mid+1;
+    }
+    return -1;
+}
+
+TT_INLINE int tt_lower_bound(const void *key, const void *base, int n, int size,
+                              int (*cmp)(const void*,const void*)) {
+    int lo=0, hi=n;
+    const char *b = (const char*)base;
+    while (lo<hi) {
+        int mid=(lo+hi)/2;
+        if (cmp(b+mid*size, key)<0) lo=mid+1; else hi=mid;
+    }
+    return lo;
+}
+
+TT_INLINE int tt_upper_bound(const void *key, const void *base, int n, int size,
+                              int (*cmp)(const void*,const void*)) {
+    int lo=0, hi=n;
+    const char *b = (const char*)base;
+    while (lo<hi) {
+        int mid=(lo+hi)/2;
+        if (cmp(b+mid*size, key)<=0) lo=mid+1; else hi=mid;
+    }
+    return lo;
+}
+
+
+typedef struct { const char *ptr; size_t len; } TT_Sv;
+
+TT_INLINE TT_Sv   tt_sv(const char *s)           { TT_Sv v; v.ptr=s; v.len=strlen(s); return v; }
+TT_INLINE TT_Sv   tt_sv_n(const char *s, size_t n){ TT_Sv v; v.ptr=s; v.len=n; return v; }
+TT_INLINE int     tt_sv_eq(TT_Sv a, TT_Sv b)     { return a.len==b.len&&memcmp(a.ptr,b.ptr,a.len)==0; }
+TT_INLINE int     tt_sv_starts(TT_Sv s, TT_Sv p) { return s.len>=p.len&&memcmp(s.ptr,p.ptr,p.len)==0; }
+TT_INLINE int     tt_sv_ends(TT_Sv s, TT_Sv p)   { return s.len>=p.len&&memcmp(s.ptr+s.len-p.len,p.ptr,p.len)==0; }
+TT_INLINE TT_Sv   tt_sv_trim(TT_Sv s) {
+    while (s.len && isspace((unsigned char)*s.ptr)) { s.ptr++; s.len--; }
+    while (s.len && isspace((unsigned char)s.ptr[s.len-1])) s.len--;
+    return s;
+}
+TT_INLINE TT_Sv   tt_sv_slice(TT_Sv s, size_t lo, size_t hi) {
+    if (lo>s.len) { lo=s.len; } if (hi>s.len) { hi=s.len; }
+    return tt_sv_n(s.ptr+lo, hi-lo);
+}
+TT_INLINE int     tt_sv_find(TT_Sv s, TT_Sv pat) {
+    size_t i;
+    if (pat.len==0) return 0;
+    for (i=0; i+pat.len<=s.len; i++)
+        if (memcmp(s.ptr+i, pat.ptr, pat.len)==0) return (int)i;
+    return -1;
+}
+TT_INLINE char   *tt_sv_dup(TT_Sv s) { return tt_strndup(s.ptr, s.len); }
+
+
+typedef struct { char *buf; size_t len; size_t cap; } TT_SB;
+
+TT_INLINE void tt_sb_init(TT_SB *sb, size_t initial_cap) {
+    sb->buf = (char*)malloc(initial_cap ? initial_cap : 64);
+    sb->len = 0; sb->cap = initial_cap ? initial_cap : 64;
+    if (sb->buf) sb->buf[0] = '\0';
+}
+TT_INLINE void tt_sb_free(TT_SB *sb) { free(sb->buf); sb->buf=NULL; sb->len=sb->cap=0; }
+
+TT_INLINE int tt_sb_grow(TT_SB *sb, size_t needed) {
+    if (sb->len + needed < sb->cap) return 1;
+    size_t ncap = sb->cap * 2;
+    char *p;
+    while (ncap < sb->len + needed + 1) ncap *= 2;
+    p = (char*)realloc(sb->buf, ncap);
+    if (!p) return 0;
+    sb->buf = p; sb->cap = ncap;
+    return 1;
+}
+
+TT_INLINE void tt_sb_append(TT_SB *sb, const char *s, size_t n) {
+    if (!tt_sb_grow(sb, n)) return;
+    memcpy(sb->buf + sb->len, s, n);
+    sb->len += n;
+    sb->buf[sb->len] = '\0';
+}
+TT_INLINE void tt_sb_appends(TT_SB *sb, const char *s) { tt_sb_append(sb, s, strlen(s)); }
+TT_INLINE void tt_sb_appendc(TT_SB *sb, char c)        { tt_sb_append(sb, &c, 1); }
+TT_INLINE void tt_sb_appendf(TT_SB *sb, const char *fmt, ...) {
+    char tmp[1024]; va_list ap;
+    va_start(ap, fmt); tt_vsnprintf(tmp, sizeof(tmp), fmt, ap); va_end(ap);
+    tt_sb_appends(sb, tmp);
+}
+TT_INLINE void tt_sb_clear(TT_SB *sb) { sb->len=0; if(sb->buf) sb->buf[0]='\0'; }
+TT_INLINE char *tt_sb_finish(TT_SB *sb) { return sb->buf; }
+
+
+#define TT_SHA256_DIGEST_LEN 32
+
+typedef struct {
+    tt_u32 state[8];
+    tt_u64 count;
+    tt_u8  buf[64];
+    int    buflen;
+} TT_Sha256;
+
+static const tt_u32 tt__sha256_k[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+
+#define TT_SHA256_ROTR(x,n) (((x)>>(n))|((x)<<(32-(n))))
+#define TT_SHA256_CH(x,y,z)  (((x)&(y))^(~(x)&(z)))
+#define TT_SHA256_MAJ(x,y,z) (((x)&(y))^((x)&(z))^((y)&(z)))
+#define TT_SHA256_S0(x)  (TT_SHA256_ROTR(x,2)^TT_SHA256_ROTR(x,13)^TT_SHA256_ROTR(x,22))
+#define TT_SHA256_S1(x)  (TT_SHA256_ROTR(x,6)^TT_SHA256_ROTR(x,11)^TT_SHA256_ROTR(x,25))
+#define TT_SHA256_G0(x)  (TT_SHA256_ROTR(x,7)^TT_SHA256_ROTR(x,18)^((x)>>3))
+#define TT_SHA256_G1(x)  (TT_SHA256_ROTR(x,17)^TT_SHA256_ROTR(x,19)^((x)>>10))
+
+static void tt__sha256_transform(TT_Sha256 *ctx, const tt_u8 *block) {
+    tt_u32 w[64], a,b,c,d,e,f,g,h,t1,t2;
+    int i;
+    for (i=0;i<16;i++) w[i]=((tt_u32)block[i*4]<<24)|((tt_u32)block[i*4+1]<<16)|((tt_u32)block[i*4+2]<<8)|block[i*4+3];
+    for (i=16;i<64;i++) w[i]=TT_SHA256_G1(w[i-2])+w[i-7]+TT_SHA256_G0(w[i-15])+w[i-16];
+    a=ctx->state[0];b=ctx->state[1];c=ctx->state[2];d=ctx->state[3];
+    e=ctx->state[4];f=ctx->state[5];g=ctx->state[6];h=ctx->state[7];
+    for (i=0;i<64;i++){
+        t1=h+TT_SHA256_S1(e)+TT_SHA256_CH(e,f,g)+tt__sha256_k[i]+w[i];
+        t2=TT_SHA256_S0(a)+TT_SHA256_MAJ(a,b,c);
+        h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;
+    }
+    ctx->state[0]+=a;ctx->state[1]+=b;ctx->state[2]+=c;ctx->state[3]+=d;
+    ctx->state[4]+=e;ctx->state[5]+=f;ctx->state[6]+=g;ctx->state[7]+=h;
+}
+
+TT_INLINE void tt_sha256_init(TT_Sha256 *ctx) {
+    ctx->state[0]=0x6a09e667; ctx->state[1]=0xbb67ae85;
+    ctx->state[2]=0x3c6ef372; ctx->state[3]=0xa54ff53a;
+    ctx->state[4]=0x510e527f; ctx->state[5]=0x9b05688c;
+    ctx->state[6]=0x1f83d9ab; ctx->state[7]=0x5be0cd19;
+    ctx->count=0; ctx->buflen=0;
+}
+
+TT_INLINE void tt_sha256_update(TT_Sha256 *ctx, const void *data, size_t len) {
+    const tt_u8 *p = (const tt_u8*)data;
+    while (len > 0) {
+        int space = 64 - ctx->buflen;
+        int take  = (int)len < space ? (int)len : space;
+        memcpy(ctx->buf + ctx->buflen, p, (size_t)take);
+        ctx->buflen += take; p += take; len -= (size_t)take;
+        ctx->count  += (tt_u64)take * 8;
+        if (ctx->buflen == 64) { tt__sha256_transform(ctx, ctx->buf); ctx->buflen=0; }
+    }
+}
+
+TT_INLINE void tt_sha256_final(TT_Sha256 *ctx, tt_u8 digest[TT_SHA256_DIGEST_LEN]) {
+    int i; tt_u64 bc = ctx->count;
+    ctx->buf[ctx->buflen++] = 0x80;
+    if (ctx->buflen > 56) { memset(ctx->buf+ctx->buflen,0,(size_t)(64-ctx->buflen)); tt__sha256_transform(ctx,ctx->buf); ctx->buflen=0; }
+    memset(ctx->buf+ctx->buflen,0,(size_t)(56-ctx->buflen));
+    for (i=0;i<8;i++) ctx->buf[56+i]=(tt_u8)(bc>>(56-i*8));
+    tt__sha256_transform(ctx,ctx->buf);
+    for (i=0;i<8;i++){digest[i*4]=(tt_u8)(ctx->state[i]>>24);digest[i*4+1]=(tt_u8)(ctx->state[i]>>16);digest[i*4+2]=(tt_u8)(ctx->state[i]>>8);digest[i*4+3]=(tt_u8)ctx->state[i];}
+}
+
+TT_INLINE void tt_sha256(const void *data, size_t len, tt_u8 digest[TT_SHA256_DIGEST_LEN]) {
+    TT_Sha256 ctx; tt_sha256_init(&ctx); tt_sha256_update(&ctx,data,len); tt_sha256_final(&ctx,digest);
+}
+
+TT_INLINE void tt_sha256_hex(const void *data, size_t len, char out[65]) {
+    tt_u8 d[32]; int i; tt_sha256(data,len,d);
+    for (i=0;i<32;i++) tt_snprintf(out+i*2,3,"%02x",d[i]);
+    out[64]='\0';
+}
+
+
+#define TT_MD5_DIGEST_LEN 16
+
+typedef struct { tt_u32 state[4]; tt_u64 count; tt_u8 buf[64]; int buflen; } TT_Md5;
+
+static const tt_u32 tt__md5_t[64] = {
+    0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+    0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+    0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+    0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+    0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+    0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+    0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+    0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391
+};
+static const tt_u8 tt__md5_s[64] = {
+    7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+    5, 9,14,20,5, 9,14,20,5, 9,14,20,5, 9,14,20,
+    4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+    6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21
+};
+
+#define TT_MD5_ROTL(x,n) (((x)<<(n))|((x)>>(32-(n))))
+#define TT_MD5_LE32(b) ((tt_u32)(b)[0]|((tt_u32)(b)[1]<<8)|((tt_u32)(b)[2]<<16)|((tt_u32)(b)[3]<<24))
+
+static void tt__md5_transform(TT_Md5 *ctx, const tt_u8 *block) {
+    tt_u32 a=ctx->state[0],b=ctx->state[1],c=ctx->state[2],d=ctx->state[3],f,g,tmp;
+    tt_u32 m[16]; int i;
+    for (i=0;i<16;i++) m[i]=TT_MD5_LE32(block+i*4);
+    for (i=0;i<64;i++){
+        if (i<16){f=(b&c)|(~b&d);g=(tt_u32)i;}
+        else if (i<32){f=(d&b)|(~d&c);g=(tt_u32)(5*i+1)%16;}
+        else if (i<48){f=b^c^d;g=(tt_u32)(3*i+5)%16;}
+        else{f=c^(b|~d);g=(tt_u32)(7*i)%16;}
+        tmp=d;d=c;c=b;b=b+TT_MD5_ROTL(a+f+tt__md5_t[i]+m[g],(int)tt__md5_s[i]);a=tmp;
+    }
+    ctx->state[0]+=a;ctx->state[1]+=b;ctx->state[2]+=c;ctx->state[3]+=d;
+}
+
+TT_INLINE void tt_md5_init(TT_Md5 *c){c->state[0]=0x67452301;c->state[1]=0xefcdab89;c->state[2]=0x98badcfe;c->state[3]=0x10325476;c->count=0;c->buflen=0;}
+
+TT_INLINE void tt_md5_update(TT_Md5 *ctx, const void *data, size_t len) {
+    const tt_u8 *p=(const tt_u8*)data;
+    while (len>0){
+        int sp=64-ctx->buflen, tk=(int)len<sp?(int)len:sp;
+        memcpy(ctx->buf+ctx->buflen,p,(size_t)tk);
+        ctx->buflen+=tk;p+=tk;len-=(size_t)tk;ctx->count+=(tt_u64)tk*8;
+        if(ctx->buflen==64){tt__md5_transform(ctx,ctx->buf);ctx->buflen=0;}
+    }
+}
+
+TT_INLINE void tt_md5_final(TT_Md5 *ctx, tt_u8 digest[TT_MD5_DIGEST_LEN]) {
+    int i; tt_u64 bc=ctx->count;
+    ctx->buf[ctx->buflen++]=0x80;
+    if(ctx->buflen>56){memset(ctx->buf+ctx->buflen,0,(size_t)(64-ctx->buflen));tt__md5_transform(ctx,ctx->buf);ctx->buflen=0;}
+    memset(ctx->buf+ctx->buflen,0,(size_t)(56-ctx->buflen));
+    for(i=0;i<8;i++) ctx->buf[56+i]=(tt_u8)(bc>>(i*8));
+    tt__md5_transform(ctx,ctx->buf);
+    for(i=0;i<4;i++){digest[i*4]=(tt_u8)ctx->state[i];digest[i*4+1]=(tt_u8)(ctx->state[i]>>8);digest[i*4+2]=(tt_u8)(ctx->state[i]>>16);digest[i*4+3]=(tt_u8)(ctx->state[i]>>24);}
+}
+
+TT_INLINE void tt_md5(const void *data, size_t len, tt_u8 digest[TT_MD5_DIGEST_LEN]) {
+    TT_Md5 c; tt_md5_init(&c); tt_md5_update(&c,data,len); tt_md5_final(&c,digest);
+}
+
+TT_INLINE void tt_md5_hex(const void *data, size_t len, char out[33]) {
+    tt_u8 d[16]; int i; tt_md5(data,len,d);
+    for(i=0;i<16;i++) tt_snprintf(out+i*2,3,"%02x",d[i]);
+    out[32]='\0';
+}
+
+
+TT_INLINE void tt_url_encode(const char *in, char *out, size_t out_sz) {
+    static const char hex[]="0123456789ABCDEF";
+    size_t j=0;
+    while (*in && j+3 < out_sz) {
+        unsigned char c=(unsigned char)*in++;
+        if (isalnum(c)||c=='-'||c=='_'||c=='.'||c=='~') { out[j++]=(char)c; }
+        else { out[j++]='%'; out[j++]=hex[c>>4]; out[j++]=hex[c&0xF]; }
+    }
+    out[j]='\0';
+}
+
+TT_INLINE void tt_url_decode(const char *in, char *out, size_t out_sz) {
+    size_t j=0;
+    while (*in && j+1 < out_sz) {
+        if (*in=='%'&&in[1]&&in[2]) {
+            char hi=in[1], lo=in[2];
+            int h = isdigit((unsigned char)hi)?hi-'0':tolower((unsigned char)hi)-'a'+10;
+            int l = isdigit((unsigned char)lo)?lo-'0':tolower((unsigned char)lo)-'a'+10;
+            out[j++]=(char)((h<<4)|l); in+=3;
+        } else if (*in=='+') { out[j++]=' '; in++; }
+        else { out[j++]=*in++; }
+    }
+    out[j]='\0';
+}
+
+
+TT_INLINE int tt_fnmatch(const char *pat, const char *str) {
+    while (*pat && *str) {
+        if (*pat == '*') {
+            while (*pat=='*') pat++;
+            if (!*pat) return 1;
+            while (*str) { if (tt_fnmatch(pat,str)) return 1; str++; }
+            return 0;
+        } else if (*pat == '?') { pat++; str++; }
+        else if (*pat == '[') {
+            int neg=0, matched=0;
+            pat++;
+            if (*pat=='!'){neg=1;pat++;}
+            while (*pat && *pat!=']') {
+                if (*(pat+1)=='-'&&*(pat+2)&&*(pat+2)!=']'){
+                    if (*str>=(unsigned char)*pat&&*str<=(unsigned char)*(pat+2)) matched=1;
+                    pat+=3;
+                } else { if (*str==(unsigned char)*pat) matched=1; pat++; }
+            }
+            if (*pat==']') pat++;
+            if (matched==neg) return 0;
+            str++;
+        } else { if (*pat!=*str) return 0; pat++; str++; }
+    }
+    while (*pat=='*') pat++;
+    return !*pat && !*str;
+}
+
+
+typedef struct {
+    int    optind;
+    int    optopt;
+    char  *optarg;
+    int    _sp;                                                       
+} TT_Getopt;
+
+TT_INLINE void tt_getopt_init(TT_Getopt *g) { g->optind=1; g->optopt=0; g->optarg=NULL; g->_sp=1; }
+
+TT_INLINE int tt_getopt(TT_Getopt *g, int argc, char *const argv[], const char *opts) {
+    const char *oli;
+    if (g->optind >= argc || !argv[g->optind]) return -1;
+    if (g->_sp == 1) {
+        if (argv[g->optind][0]!='-'||argv[g->optind][1]=='\0') return -1;
+        if (argv[g->optind][1]=='-'&&argv[g->optind][2]=='\0') { g->optind++; return -1; }
+    }
+    g->optopt = (int)(unsigned char)argv[g->optind][g->_sp];
+    oli = strchr(opts, (char)g->optopt);
+    if (!oli) { if (!argv[g->optind][++g->_sp]){g->optind++;g->_sp=1;} return '?'; }
+    if (*(oli+1)==':') {
+        if (argv[g->optind][g->_sp+1]) g->optarg=argv[g->optind++]+g->_sp+1;
+        else if (g->optind+1 >= argc) { if (*opts!=':'){} g->optarg=NULL; g->optind++; g->_sp=1; return ':'; }
+        else g->optarg=argv[++g->optind];
+        g->_sp=1; g->optind++;
+    } else { if (!argv[g->optind][++g->_sp]){g->optind++;g->_sp=1;} g->optarg=NULL; }
+    return g->optopt;
+}
+
+
+#define TT_ARGS_MAX 64
+
+typedef struct {
+    const char *keys[TT_ARGS_MAX];
+    const char *vals[TT_ARGS_MAX];                               
+    const char *positional[TT_ARGS_MAX];
+    int         nkeys;
+    int         npositional;
+} TT_Args;
+
+TT_INLINE void tt_args_parse(TT_Args *a, int argc, char *const argv[]) {
+    int i;
+    memset(a, 0, sizeof(*a));
+    for (i=1; i<argc; i++) {
+        const char *s = argv[i];
+        const char *eq;
+        if (s[0]=='-'&&s[1]=='-') {
+            s+=2; eq=strchr(s,'=');
+            if (eq && a->nkeys<TT_ARGS_MAX) {
+                a->keys[a->nkeys]   = s;
+                a->vals[a->nkeys++] = eq+1;
+            } else if (a->nkeys<TT_ARGS_MAX) {
+                a->keys[a->nkeys]   = s;
+                a->vals[a->nkeys++] = NULL;
+            }
+        } else if (s[0]=='-'&&s[1]) {
+            s++;
+            if (a->nkeys<TT_ARGS_MAX) { a->keys[a->nkeys]=s; a->vals[a->nkeys++]=NULL; }
+        } else {
+            if (a->npositional<TT_ARGS_MAX) a->positional[a->npositional++]=s;
+        }
+    }
+}
+
+TT_INLINE const char *tt_args_get(const TT_Args *a, const char *key) {
+    int i;
+    for (i=0;i<a->nkeys;i++)
+        if (tt_strcasecmp(a->keys[i],key)==0) return a->vals[i] ? a->vals[i] : "";
+    return NULL;
+}
+
+TT_INLINE int tt_args_flag(const TT_Args *a, const char *key) { return tt_args_get(a,key)!=NULL; }
+
+
+TT_INLINE int tt_is_little_endian(void) {
+    tt_u16 v = 1; return *(tt_u8*)&v == 1;
+}
+
+TT_INLINE tt_u16 tt_bswap16(tt_u16 x) { return (tt_u16)((x>>8)|(x<<8)); }
+TT_INLINE tt_u32 tt_bswap32(tt_u32 x) {
+    return ((x>>24)&0xFF)|((x>>8)&0xFF00)|((x<<8)&0xFF0000)|((x<<24)&0xFF000000u);
+}
+TT_INLINE tt_u64 tt_bswap64(tt_u64 x) {
+    return ((tt_u64)tt_bswap32((tt_u32)x)<<32)|tt_bswap32((tt_u32)(x>>32));
+}
+
+TT_INLINE tt_u16 tt_htole16(tt_u16 x) { return tt_is_little_endian() ? x : tt_bswap16(x); }
+TT_INLINE tt_u32 tt_htole32(tt_u32 x) { return tt_is_little_endian() ? x : tt_bswap32(x); }
+TT_INLINE tt_u16 tt_htobe16(tt_u16 x) { return tt_is_little_endian() ? tt_bswap16(x) : x; }
+TT_INLINE tt_u32 tt_htobe32(tt_u32 x) { return tt_is_little_endian() ? tt_bswap32(x) : x; }
+TT_INLINE tt_u16 tt_le16toh(tt_u16 x) { return tt_htole16(x); }
+TT_INLINE tt_u32 tt_le32toh(tt_u32 x) { return tt_htole32(x); }
+TT_INLINE tt_u16 tt_be16toh(tt_u16 x) { return tt_htobe16(x); }
+TT_INLINE tt_u32 tt_be32toh(tt_u32 x) { return tt_htobe32(x); }
+
+
+typedef struct { int year,month,day,hour,min,sec; } TT_DateTime;
+
+TT_INLINE TT_DateTime tt_datetime_now(void) {
+    TT_DateTime dt; time_t t=time(NULL); struct tm *tm=localtime(&t);
+    dt.year=tm->tm_year+1900; dt.month=tm->tm_mon+1; dt.day=tm->tm_mday;
+    dt.hour=tm->tm_hour; dt.min=tm->tm_min; dt.sec=tm->tm_sec;
+    return dt;
+}
+
+TT_INLINE void tt_datetime_to_iso8601(TT_DateTime dt, char *buf, int bufsz) {
+    tt_snprintf(buf, (size_t)bufsz, "%04d-%02d-%02dT%02d:%02d:%02d",
+                dt.year,dt.month,dt.day,dt.hour,dt.min,dt.sec);
+}
+
+TT_INLINE int tt_is_leap_year(int y) { return (y%4==0&&y%100!=0)||(y%400==0); }
+
+TT_INLINE int tt_days_in_month(int m, int y) {
+    static const int days[]={31,28,31,30,31,30,31,31,30,31,30,31};
+    if (m==2&&tt_is_leap_year(y)) return 29;
+    return days[(m-1)%12];
+}
+
+TT_INLINE int tt_date_to_days(int y, int m, int d) {
+    int days=(y-1970)*365+(y-1969)/4-(y-1601)/100+(y-1601)/400;
+    static const int md[]={0,31,59,90,120,151,181,212,243,273,304,334};
+    days+=md[m-1]+d-1;
+    if (m>2&&tt_is_leap_year(y)) days++;
+    return days;
+}
+
+
+TT_INLINE void tt_sparkline(int x, int y, const double *data, int count) {
+    static const char *bars[] = {" ","_","\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                  "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86","\xe2\x96\x87","\xe2\x96\x88"};
+    double mn=data[0],mx=data[0];
+    int i;
+    for (i=1;i<count;i++){if(data[i]<mn)mn=data[i];if(data[i]>mx)mx=data[i];}
+    tt_goto(x, y);
+    for (i=0;i<count;i++){
+        int idx = (mx>mn) ? (int)((data[i]-mn)/(mx-mn)*9.0) : 4;
+        if (idx<0) { idx=0; } if (idx>9) { idx=9; }
+        tt_write(bars[idx]);
+    }
+}
+
+TT_INLINE void tt_heatmap(int x, int y, const double *data, int rows, int cols) {
+    int i, j;
+    double mn=data[0],mx=data[0];
+    for (i=0;i<rows*cols;i++){if(data[i]<mn)mn=data[i];if(data[i]>mx)mx=data[i];}
+    for (j=0;j<rows;j++) for (i=0;i<cols;i++) {
+        double v = (mx>mn)?(data[j*cols+i]-mn)/(mx-mn):0.5;
+        int ci = 16 + (int)(v * 215.0);                     
+        char col[24];
+        tt_bg(col, sizeof(col), ci);
+        tt_goto(x+i, y+j);
+        tt_write(col);
+        tt_write("  ");
+        tt_write(TT_RESET);
+    }
+}
+
+TT_INLINE void tt_pie_chart(int cx, int cy, int radius,
+                             const double *slices, int count) {
+    static const char *chars[] = {"*","#","@","+","=","-","~","&","%","$"};
+    int dy, dx;
+    for (dy=-radius;dy<=radius;dy++) for (dx=-radius*2;dx<=radius*2;dx++) {
+        double px=dx/2.0, py=dy;
+        if (px*px+py*py <= (double)radius*radius) {
+            double angle=atan2(py,px);
+            if (angle<0) angle+=2.0*TT_PI;
+            double accum=0.0, total=0.0; int k, si=0;
+            for (k=0;k<count;k++) total+=slices[k];
+            if (total<=0) total=1;
+            for (k=0;k<count;k++){
+                accum+=slices[k]/total*2.0*TT_PI;
+                if (angle<=accum){si=k;break;}
+            }
+            tt_draw(cx+dx, cy+dy, chars[si%10]);
+        }
+    }
+}
+
+
+#define TT_MULTIBAR_MAX 16
+
+typedef struct {
+    const char *label;
+    double      value;                   
+    int         color;
+} TT_BarRow;
+
+typedef struct {
+    TT_BarRow rows[TT_MULTIBAR_MAX];
+    int       count;
+    int       x, y, bar_width;
+} TT_MultiBar;
+
+TT_INLINE void tt_multibar_init(TT_MultiBar *mb, int x, int y, int bar_w) {
+    mb->count=0; mb->x=x; mb->y=y; mb->bar_width=bar_w;
+}
+
+TT_INLINE void tt_multibar_set(TT_MultiBar *mb, int idx,
+                                const char *label, double v, int color) {
+    if (idx<0||idx>=TT_MULTIBAR_MAX) return;
+    mb->rows[idx].label=label; mb->rows[idx].value=v; mb->rows[idx].color=color;
+    if (idx>=mb->count) mb->count=idx+1;
+}
+
+TT_INLINE void tt_multibar_draw(const TT_MultiBar *mb) {
+    int i;
+    for (i=0;i<mb->count;i++){
+        char col[24]; int pct=(int)(mb->rows[i].value*100.0);
+        char pct_str[8];
+        tt_snprintf(pct_str, sizeof(pct_str), " %3d%%", pct);
+        tt_goto(mb->x, mb->y+i);
+        tt_fg(col, sizeof(col), mb->rows[i].color);
+        tt_write(col);
+        tt_writef("%-12s ", mb->rows[i].label ? mb->rows[i].label : "");
+        tt_write(TT_RESET);
+        tt_progress(mb->x+14, mb->y+i, mb->bar_width,
+                    mb->rows[i].value, 1.0, '#', '.');
+        tt_draw(mb->x+14+mb->bar_width, mb->y+i, pct_str);
+    }
+}
+
+
+TT_INLINE float tt_synth_sine(double phase)     { return (float)sin(phase * 2.0 * TT_PI); }
+TT_INLINE float tt_synth_square(double phase)   { return (phase - (int)phase) < 0.5f ? 1.0f : -1.0f; }
+TT_INLINE float tt_synth_saw(double phase)      { return (float)(2.0 * (phase - (int)phase) - 1.0); }
+TT_INLINE float tt_synth_tri(double phase)      {
+    double p = phase - (int)phase;
+    return (float)(p < 0.5 ? 4.0*p - 1.0 : 3.0 - 4.0*p);
+}
+TT_INLINE float tt_synth_noise(void)            { return (float)(tt_randf() * 2.0 - 1.0); }
+
+typedef struct { double attack, decay, sustain, release; } TT_ADSR;
+TT_INLINE double tt_adsr_sample(const TT_ADSR *e, double t, double duration) {
+    double note_off = duration - e->release;
+    if (t < e->attack)              return t / e->attack;
+    if (t < e->attack + e->decay)  return 1.0 - (1.0-e->sustain)*(t-e->attack)/e->decay;
+    if (t < note_off)               return e->sustain;
+    if (t < duration)               return e->sustain * (1.0 - (t-note_off)/e->release);
+    return 0.0;
+}
+
+TT_INLINE float tt_synth_fm(double t, double carrier_hz, double mod_hz, double mod_depth) {
+    double mod   = sin(2.0*TT_PI*mod_hz*t) * mod_depth;
+    return (float)sin(2.0*TT_PI*(carrier_hz+mod)*t);
+}
+
+TT_INLINE void tt_synth_tone(TT_Wav *out, double freq, double duration,
+                              const TT_ADSR *env, tt_u32 sample_rate) {
+    tt_u32 n = (tt_u32)(duration * sample_rate), i;
+    out->sample_rate=sample_rate; out->channels=1;
+    out->bits_per_sample=16; out->num_samples=n;
+    out->data=(float*)malloc(n*sizeof(float));
+    if (!out->data) return;
+    for (i=0;i<n;i++){
+        double t=(double)i/(double)sample_rate;
+        double phase=freq*t;
+        double amp = env ? tt_adsr_sample(env,t,duration) : 1.0;
+        out->data[i]=tt_synth_sine(phase)*(float)amp;
+    }
+}
+
+TT_INLINE void tt_synth_mix(TT_Wav *dst, const TT_Wav *src, float gain) {
+    tt_u32 i, n = dst->num_samples < src->num_samples ? dst->num_samples : src->num_samples;
+    for (i=0;i<n;i++) {
+        dst->data[i] = tt_clamp_f((double)(dst->data[i] + src->data[i]*gain), -1.0, 1.0);
+    }
+}
+
+#ifdef TT_ENABLE_SOCKETS
+
+#ifdef TT_WINDOWS
+   typedef SOCKET TT_Socket;
+#  define TT_INVALID_SOCKET INVALID_SOCKET
+#  define TT_SOCKET_ERROR   SOCKET_ERROR
+#  ifndef _WIN32_WINNT
+#    define _WIN32_WINNT 0x0501
+#  endif
+#  if defined(__MINGW32__) && !defined(socklen_t)
+     typedef int socklen_t;
+#  endif
+#else
+   typedef int TT_Socket;
+#  define TT_INVALID_SOCKET (-1)
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <arpa/inet.h>
+#  include <netdb.h>
+#  define TT_SOCKET_ERROR   (-1)
+#endif
+
+TT_INLINE int tt_socket_init(void) {
+#ifdef TT_WINDOWS
+    WSADATA wsa; return WSAStartup(MAKEWORD(2,2),&wsa)==0;
+#else
+    return 1;
+#endif
+}
+
+TT_INLINE void tt_socket_cleanup(void) {
+#ifdef TT_WINDOWS
+    WSACleanup();
+#endif
+}
+
+TT_INLINE TT_Socket tt_socket_connect(const char *host, int port) {
+    struct addrinfo hints, *res;
+    char port_s[16];
+    TT_Socket fd;
+    memset(&hints,0,sizeof(hints));
+    hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
+    tt_snprintf(port_s, sizeof(port_s), "%d", port);
+    if (getaddrinfo(host, port_s, &hints, &res)!=0) return TT_INVALID_SOCKET;
+    fd=(TT_Socket)socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd==TT_INVALID_SOCKET){freeaddrinfo(res);return TT_INVALID_SOCKET;}
+    if (connect(fd, res->ai_addr, (int)res->ai_addrlen)!=0){
+#ifdef TT_WINDOWS
+        closesocket(fd);
+#else
+        close(fd);
+#endif
+        freeaddrinfo(res); return TT_INVALID_SOCKET;
+    }
+    freeaddrinfo(res); return fd;
+}
+
+TT_INLINE TT_Socket tt_socket_listen(int port) {
+    struct sockaddr_in addr;
+    TT_Socket fd=(TT_Socket)socket(AF_INET,SOCK_STREAM,0);
+    int opt=1;
+    if (fd==TT_INVALID_SOCKET) return fd;
+#ifdef TT_WINDOWS
+    setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
+#else
+    setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
+#endif
+    memset(&addr,0,sizeof(addr));
+    addr.sin_family=AF_INET; addr.sin_addr.s_addr=INADDR_ANY;
+    addr.sin_port=tt_htobe16((tt_u16)port);
+    if (bind(fd,(struct sockaddr*)&addr,sizeof(addr))!=0||listen(fd,8)!=0){
+#ifdef TT_WINDOWS
+        closesocket(fd);
+#else
+        close(fd);
+#endif
+        return TT_INVALID_SOCKET;
+    }
+    return fd;
+}
+
+TT_INLINE TT_Socket tt_socket_accept(TT_Socket srv) {
+    struct sockaddr_in ca; int cl=sizeof(ca);
+    return (TT_Socket)accept(srv,(struct sockaddr*)&ca,(socklen_t*)&cl);
+}
+
+TT_INLINE int tt_socket_send(TT_Socket fd, const void *data, int len) {
+#ifdef TT_WINDOWS
+    return send(fd,(const char*)data,len,0);
+#else
+    return (int)send(fd,data,(size_t)len,0);
+#endif
+}
+
+TT_INLINE int tt_socket_recv(TT_Socket fd, void *buf, int len) {
+#ifdef TT_WINDOWS
+    return recv(fd,(char*)buf,len,0);
+#else
+    return (int)recv(fd,buf,(size_t)len,0);
+#endif
+}
+
+TT_INLINE void tt_socket_close(TT_Socket fd) {
+#ifdef TT_WINDOWS
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+}
+
+#endif
+
+typedef volatile int       TT_AtomicInt;
+typedef volatile tt_u32    TT_AtomicU32;
+typedef volatile long      TT_AtomicLong;
+
+TT_INLINE int      tt_atomic_load_i(const TT_AtomicInt  *p) { return *p; }
+TT_INLINE tt_u32   tt_atomic_load_u(const TT_AtomicU32  *p) { return *p; }
+TT_INLINE long     tt_atomic_load_l(const TT_AtomicLong *p) { return *p; }
+
+TT_INLINE void tt_atomic_store_i(TT_AtomicInt  *p, int v)    { *p = v; }
+TT_INLINE void tt_atomic_store_u(TT_AtomicU32  *p, tt_u32 v) { *p = v; }
+TT_INLINE void tt_atomic_store_l(TT_AtomicLong *p, long v)   { *p = v; }
+
+TT_INLINE int  tt_atomic_inc_i(TT_AtomicInt *p)  { return ++(*p); }
+TT_INLINE int  tt_atomic_dec_i(TT_AtomicInt *p)  { return --(*p); }
+
+#if defined(__GNUC__) || defined(__clang__)
+#  define TT_COMPILER_BARRIER() __asm__ __volatile__("" ::: "memory")
+#elif defined(_MSC_VER)
+#  define TT_COMPILER_BARRIER() _ReadWriteBarrier()
+#else
+#  define TT_COMPILER_BARRIER() ((void)0)
+#endif
+
+
+#define TT_PROF_MAX 64
+
+typedef struct {
+    const char *name;
+    double      start;
+    double      total;
+    int         calls;
+    int         parent;
+} TT_ProfZone;
+
+typedef struct {
+    TT_ProfZone zones[TT_PROF_MAX];
+    int         count;
+    int         cur;                                       
+} TT_Profiler;
+
+TT_INLINE void tt_prof_init(TT_Profiler *p) {
+    memset(p, 0, sizeof(*p)); p->count=0; p->cur=-1;
+}
+
+TT_INLINE void tt_prof_begin(TT_Profiler *p, const char *name) {
+    int i;
+    for (i=0;i<p->count;i++) if (p->zones[i].name==name) break;
+    if (i==p->count && p->count<TT_PROF_MAX) {
+        p->zones[i].name=name; p->zones[i].total=0; p->zones[i].calls=0;
+        p->zones[i].parent=p->cur;
+        p->count++;
+    }
+    p->zones[i].start=tt_time(); p->zones[i].calls++;
+    p->cur=i;
+}
+
+TT_INLINE void tt_prof_end(TT_Profiler *p) {
+    if (p->cur<0||p->cur>=p->count) return;
+    p->zones[p->cur].total += tt_time()-p->zones[p->cur].start;
+    p->cur = p->zones[p->cur].parent;
+}
+
+TT_INLINE void tt_prof_print(const TT_Profiler *p) {
+    int i;
+    printf("%-28s %8s %12s %12s\n","Zone","Calls","Total(ms)","Avg(ms)");
+    printf("%-28s %8s %12s %12s\n","----","-----","---------","-------");
+    for (i=0;i<p->count;i++) {
+        double ms=p->zones[i].total*1000.0;
+        double avg=p->zones[i].calls?ms/p->zones[i].calls:0.0;
+        printf("%-28s %8d %12.3f %12.3f\n",
+               p->zones[i].name, p->zones[i].calls, ms, avg);
+    }
+}
+
+
+#define TT_STATIC_ASSERT(cond, msg) \
+    typedef char tt__static_assert_##msg[(cond)?1:-1]
+
+TT_STATIC_ASSERT(sizeof(tt_u8)==1,  u8_is_1_byte);
+TT_STATIC_ASSERT(sizeof(tt_u16)==2, u16_is_2_bytes);
+TT_STATIC_ASSERT(sizeof(tt_u32)==4, u32_is_4_bytes);
+TT_STATIC_ASSERT(sizeof(tt_u64)==8, u64_is_8_bytes);
+
+
+typedef enum {
+    TT_ANSI_NONE, TT_ANSI_CURSOR_POS, TT_ANSI_CURSOR_UP,
+    TT_ANSI_CURSOR_DOWN, TT_ANSI_CURSOR_RIGHT, TT_ANSI_CURSOR_LEFT,
+    TT_ANSI_KEY_F1, TT_ANSI_KEY_F2, TT_ANSI_KEY_F3, TT_ANSI_KEY_F4,
+    TT_ANSI_KEY_HOME, TT_ANSI_KEY_END, TT_ANSI_KEY_INS, TT_ANSI_KEY_DEL,
+    TT_ANSI_KEY_PGUP, TT_ANSI_KEY_PGDN, TT_ANSI_MOUSE,
+    TT_ANSI_UNKNOWN
+} TT_AnsiEvType;
+
+typedef struct {
+    TT_AnsiEvType type;
+    int p1, p2;                                                                       
+} TT_AnsiEvent;
+
+TT_INLINE int tt_ansi_parse(const char *seq, int len, TT_AnsiEvent *ev) {
+    int n=1, p1=0, p2=0;
+    memset(ev,0,sizeof(*ev)); ev->type=TT_ANSI_UNKNOWN;
+    if (len<2) return 0;
+    if (seq[0]=='[') {
+        const char *s=seq+1; n=2;
+        while (n<len && ((*s>='0'&&*s<='9')||*s==';')) {
+            if (*s==';'){p1=p2;p2=0;}
+            else { p2=p2*10+(*s-'0'); }
+            s++; n++;
+        }
+        if (n>=len) return 0;
+        switch (*s) {
+            case 'A': ev->type=TT_ANSI_CURSOR_UP;    ev->p1=p2?p2:1; break;
+            case 'B': ev->type=TT_ANSI_CURSOR_DOWN;  ev->p1=p2?p2:1; break;
+            case 'C': ev->type=TT_ANSI_CURSOR_RIGHT; ev->p1=p2?p2:1; break;
+            case 'D': ev->type=TT_ANSI_CURSOR_LEFT;  ev->p1=p2?p2:1; break;
+            case 'H': ev->type=TT_ANSI_CURSOR_POS;   ev->p1=p1;ev->p2=p2; break;
+            case 'F': ev->type=TT_ANSI_KEY_END;   break;
+            case '~':
+                switch (p1?p1:p2) {
+                    case 1: case 7: ev->type=TT_ANSI_KEY_HOME; break;
+                    case 2: ev->type=TT_ANSI_KEY_INS;  break;
+                    case 3: ev->type=TT_ANSI_KEY_DEL;  break;
+                    case 5: ev->type=TT_ANSI_KEY_PGUP; break;
+                    case 6: ev->type=TT_ANSI_KEY_PGDN; break;
+                    case 11:ev->type=TT_ANSI_KEY_F1;   break;
+                    case 12:ev->type=TT_ANSI_KEY_F2;   break;
+                    case 13:ev->type=TT_ANSI_KEY_F3;   break;
+                    case 14:ev->type=TT_ANSI_KEY_F4;   break;
+                }
+                break;
+            case 'M':                
+                ev->type=TT_ANSI_MOUSE;
+                if (n+2<len){ev->p1=(unsigned char)s[1]-32;ev->p2=(unsigned char)s[2]-32;}
+                n+=3; break;
+        }
+        n++;
+    }
+    return n;
+}
+
+
+#if !defined(__bool_true_false_are_defined) && !defined(__cplusplus)
+#  if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
+#  else
+#    define bool  int
+#    define true  1
+#    define false 0
+#    define __bool_true_false_are_defined 1
+#  endif
+#endif
+
+#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 199901L
+#  define restrict
+#endif
+
+#define TT_FAM 1                                                         
+
+
+
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
+#elif defined(__GNUC__)
+#  define __func__ __FUNCTION__
+#else
+#  define __func__ "<unknown>"
+#endif
+
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#  define TT_ALIGNOF(T) _Alignof(T)
+#elif defined(__GNUC__)
+#  define TT_ALIGNOF(T) __alignof__(T)
+#else
+#  define TT_ALIGNOF(T) sizeof(T)                    
+#endif
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#  define TT_ALIGNAS(n) _Alignas(n)
+#elif defined(__GNUC__)
+#  define TT_ALIGNAS(n) __attribute__((aligned(n)))
+#elif defined(_MSC_VER)
+#  define TT_ALIGNAS(n) __declspec(align(n))
+#else
+#  define TT_ALIGNAS(n)                  
+#endif
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
+#  define TT_NODISCARD  [[nodiscard]]
+#  define TT_NORETURN   [[noreturn]]
+#elif defined(__GNUC__)
+#  define TT_NODISCARD  __attribute__((warn_unused_result))
+#  define TT_NORETURN   __attribute__((noreturn))
+#elif defined(_MSC_VER)
+#  define TT_NODISCARD  _Check_return_
+#  define TT_NORETURN   __declspec(noreturn)
+#else
+#  define TT_NODISCARD
+#  define TT_NORETURN
+#endif
+
+#if defined(__GNUC__)
+#  define TT_LIKELY(x)   __builtin_expect(!!(x),1)
+#  define TT_UNLIKELY(x) __builtin_expect(!!(x),0)
+#else
+#  define TT_LIKELY(x)   (x)
+#  define TT_UNLIKELY(x) (x)
+#endif
+
+#if defined(__GNUC__)
+#  define TT_ATTR_PURE     __attribute__((pure))
+#  define TT_ATTR_CONST    __attribute__((const))
+#  define TT_ATTR_MALLOC   __attribute__((malloc))
+#  define TT_ATTR_FORMAT(f,a,b) __attribute__((format(printf,f,b)))
+#else
+#  define TT_ATTR_PURE
+#  define TT_ATTR_CONST
+#  define TT_ATTR_MALLOC
+#  define TT_ATTR_FORMAT(f,a,b)
+#endif
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#  define TT_IS_INT(x)    _Generic((x), int:1, long:1, short:1, default:0)
+#  define TT_IS_FLOAT(x)  _Generic((x), float:1, double:1, long double:1, default:0)
+#else
+#  define TT_IS_INT(x)    (sizeof(x)==sizeof(int)||sizeof(x)==sizeof(long))
+#  define TT_IS_FLOAT(x)  (sizeof(x)==sizeof(double))
+#endif
+
+
+TT_INLINE size_t tt_strnlen(const char *s, size_t maxlen) {
+    size_t i; for (i=0;i<maxlen&&s[i];i++); return i;
+}
+
+TT_INLINE void *tt_memchr(const void *s, int c, size_t n) { return (void*)memchr(s,c,n); }
+
+TT_INLINE void *tt_memmem(const void *haystack, size_t hlen,
+                            const void *needle,   size_t nlen) {
+    const tt_u8 *h = (const tt_u8*)haystack;
+    const tt_u8 *n = (const tt_u8*)needle;
+    size_t i;
+    if (!nlen) return (void*)haystack;
+    if (nlen > hlen) return NULL;
+    for (i=0; i<=hlen-nlen; i++)
+        if (memcmp(h+i, n, nlen)==0) return (void*)(h+i);
+    return NULL;
+}
+
+TT_INLINE const char *tt_strnchr_set(const char *s, size_t n, const char *chars) {
+    size_t i;
+    for (i=0;i<n&&s[i];i++) if (strchr(chars,s[i])) return s+i;
+    return NULL;
+}
+
+TT_INLINE char *tt_strrepeat(const char *s, int n) {
+    size_t sl=strlen(s), i;
+    char *out=(char*)malloc(sl*(size_t)n+1);
+    if (!out) return NULL;
+    for (i=0;i<(size_t)n;i++) memcpy(out+i*sl, s, sl);
+    out[sl*(size_t)n]='\0';
+    return out;
+}
+
+TT_INLINE char *tt_strupr(char *s) { char *p=s; while(*p){*p=(char)toupper((unsigned char)*p);p++;} return s; }
+TT_INLINE char *tt_strlwr(char *s) { char *p=s; while(*p){*p=(char)tolower((unsigned char)*p);p++;} return s; }
+
+TT_INLINE void tt_strrev(char *s) {
+    int l=0,r=(int)strlen(s)-1; char c;
+    while(l<r){c=s[l];s[l++]=s[r];s[r--]=c;}
+}
+
+TT_INLINE int tt_strcount(const char *haystack, const char *needle) {
+    int c=0; size_t nl=strlen(needle);
+    if (!nl) return 0;
+    while ((haystack=strstr(haystack,needle))) { c++; haystack+=nl; }
+    return c;
+}
+
+TT_INLINE int tt_parse_kvpairs(const char *s,
+                                char keys[][64], char vals[][256], int max_pairs) {
+    int n=0; char *buf=tt_strdup(s), *p=buf, *tok, *buf2;
+    if (!buf) return 0;
+    tok = tt_strtok_r(p," \t\n",&buf2);
+    while (tok&&n<max_pairs){
+        char *eq=strchr(tok,'=');
+        if (eq){
+            int kl=(int)(eq-tok); if(kl>63)kl=63;
+            strncpy(keys[n],tok,(size_t)kl); keys[n][kl]='\0';
+            strncpy(vals[n],eq+1,255); vals[n][255]='\0';
+        } else {
+            strncpy(keys[n],tok,63); keys[n][63]='\0'; vals[n][0]='\0';
+        }
+        n++; tok=tt_strtok_r(NULL," \t\n",&buf2);
+    }
+    free(buf); return n;
+}
+
+
+TT_INLINE int tt_ilog2(tt_u32 v) {
+    int r=0; while(v>1){v>>=1;r++;} return r;
+}
+
+TT_INLINE int tt_ilog10(tt_u64 v) {
+    int r=0; while(v>=10){v/=10;r++;} return r;
+}
+
+TT_INLINE tt_u32 tt_next_pow2(tt_u32 v) {
+    if (!v) return 1;
+    v--;v|=v>>1;v|=v>>2;v|=v>>4;v|=v>>8;v|=v>>16;
+    return v+1;
+}
+
+TT_INLINE tt_u32 tt_isqrt32(tt_u32 n) {
+    tt_u32 x=n, y=(x+1)/2;
+    while(y<x){x=y;y=(x+n/x)/2;}
+    return x;
+}
+
+TT_INLINE int tt_popcount32(tt_u32 v) {
+    v -= (v>>1) & 0x55555555u;
+    v  = ((v>>2) & 0x33333333u) + (v & 0x33333333u);
+    v  = ((v>>4) + v) & 0x0f0f0f0fu;
+    v  = (v * 0x01010101u) >> 24;
+    return (int)v;
+}
+TT_INLINE int tt_popcount64(tt_u64 v) {
+    return tt_popcount32((tt_u32)v)+tt_popcount32((tt_u32)(v>>32));
+}
+
+TT_INLINE int tt_ctz32(tt_u32 v) {
+    int c=0; if(!v) return 32;
+    while(!(v&1)){v>>=1;c++;} return c;
+}
+
+TT_INLINE int tt_clz32(tt_u32 v) {
+    int c=0; if(!v) return 32;
+    while(!(v&0x80000000u)){v<<=1;c++;} return c;
+}
+
+TT_INLINE tt_u32 tt_bitrev32(tt_u32 v) {
+    v=((v>>1)&0x55555555u)|((v&0x55555555u)<<1);
+    v=((v>>2)&0x33333333u)|((v&0x33333333u)<<2);
+    v=((v>>4)&0x0f0f0f0fu)|((v&0x0f0f0f0fu)<<4);
+    v=((v>>8)&0x00ff00ffu)|((v&0x00ff00ffu)<<8);
+    return (v>>16)|(v<<16);
+}
+
+TT_INLINE tt_i64 tt_modinv(tt_i64 a, tt_i64 m) {
+    tt_i64 g=m, x=0, y=1, tmp;
+    if (m==1) return 0;
+    while (a>1){
+        tt_i64 q=a/g; tmp=g; g=a%g; a=tmp; tmp=x; x=y-q*x; y=tmp;
+    }
+    return y<0?y+m:y;
+}
+
+TT_INLINE tt_u64 tt_ipow(tt_u64 base, tt_u64 exp) {
+    tt_u64 r=1;
+    while(exp>0){if(exp&1)r*=base;base*=base;exp>>=1;}
+    return r;
+}
+
+
+TT_INLINE void tt_mempattern(void *dst, size_t n, const void *pattern, size_t plen) {
+    tt_u8 *d=(tt_u8*)dst; size_t i;
+    for (i=0;i<n;i++) d[i]=((const tt_u8*)pattern)[i%plen];
+}
+
+TT_INLINE int tt_membyte_count(const void *data, size_t len, tt_u8 byte) {
+    const tt_u8 *p=(const tt_u8*)data; size_t i; int c=0;
+    for(i=0;i<len;i++) if(p[i]==byte) c++;
+    return c;
+}
+
+TT_INLINE void tt_memxor(void *dst, const void *a, const void *b, size_t n) {
+    tt_u8 *d=(tt_u8*)dst;
+    const tt_u8 *pa=(const tt_u8*)a, *pb=(const tt_u8*)b;
+    size_t i; for(i=0;i<n;i++) d[i]=pa[i]^pb[i];
+}
+
+TT_INLINE int tt_memcmp_safe(const void *a, const void *b, size_t n) {
+    const tt_u8 *pa=(const tt_u8*)a, *pb=(const tt_u8*)b;
+    tt_u8 diff=0; size_t i;
+    for(i=0;i<n;i++) diff|=pa[i]^pb[i];
+    return diff!=0;
+}
+
+
+typedef enum {
+    TT_JSON_NONE, TT_JSON_OBJ_BEGIN, TT_JSON_OBJ_END,
+    TT_JSON_ARR_BEGIN, TT_JSON_ARR_END,
+    TT_JSON_STRING, TT_JSON_NUMBER, TT_JSON_TRUE, TT_JSON_FALSE,
+    TT_JSON_NULL, TT_JSON_COLON, TT_JSON_COMMA, TT_JSON_END, TT_JSON_ERROR
+} TT_JsonTokType;
+
+typedef struct {
+    TT_JsonTokType type;
+    const char    *start;
+    int            len;
+} TT_JsonTok;
+
+typedef struct { const char *p; const char *end; } TT_JsonIter;
+
+TT_INLINE void tt_json_iter_init(TT_JsonIter *it, const char *json, size_t len) {
+    it->p = json; it->end = json + len;
+}
+
+TT_INLINE TT_JsonTok tt_json_next(TT_JsonIter *it) {
+    TT_JsonTok tok; tok.type=TT_JSON_NONE; tok.start=it->p; tok.len=0;
+    while (it->p<it->end && isspace((unsigned char)*it->p)) it->p++;
+    if (it->p>=it->end){tok.type=TT_JSON_END;return tok;}
+    tok.start=it->p;
+    switch (*it->p) {
+        case '{': tok.type=TT_JSON_OBJ_BEGIN; it->p++; break;
+        case '}': tok.type=TT_JSON_OBJ_END;   it->p++; break;
+        case '[': tok.type=TT_JSON_ARR_BEGIN;  it->p++; break;
+        case ']': tok.type=TT_JSON_ARR_END;   it->p++; break;
+        case ':': tok.type=TT_JSON_COLON;     it->p++; break;
+        case ',': tok.type=TT_JSON_COMMA;     it->p++; break;
+        case '"': {
+            it->p++;
+            tok.start=it->p;
+            while(it->p<it->end&&*it->p!='"'){
+                if(*it->p=='\\')it->p++;
+                it->p++;
+            }
+            tok.len=(int)(it->p-tok.start);
+            tok.type=TT_JSON_STRING;
+            if(it->p<it->end)it->p++;
+            break;
+        }
+        case 't':
+            tok.type=TT_JSON_TRUE;
+            while(it->p<it->end&&isalpha((unsigned char)*it->p))it->p++;
+            break;
+        case 'f':
+            tok.type=TT_JSON_FALSE;
+            while(it->p<it->end&&isalpha((unsigned char)*it->p))it->p++;
+            break;
+        case 'n':
+            tok.type=TT_JSON_NULL;
+            while(it->p<it->end&&isalpha((unsigned char)*it->p))it->p++;
+            break;
+        default:
+            if(*it->p=='-'||isdigit((unsigned char)*it->p)){
+                tok.type=TT_JSON_NUMBER;
+                while(it->p<it->end&&(isdigit((unsigned char)*it->p)||
+                      *it->p=='.'||*it->p=='e'||*it->p=='E'||
+                      *it->p=='+'||*it->p=='-'))it->p++;
+            } else { tok.type=TT_JSON_ERROR; it->p++; }
+            break;
+    }
+    if (!tok.len) tok.len=(int)(it->p-tok.start);
+    return tok;
+}
+
+
+static int tt__re_match(const char *pat, const char *s);
+static int tt__re_match_bracket(const char **pat, char c) {
+    int neg=0, matched=0;
+    (*pat)++;               
+    if (**pat=='^'){neg=1;(*pat)++;}
+    while (**pat&&**pat!=']'){
+        if (*((*pat)+1)=='-'&&*((*pat)+2)&&*((*pat)+2)!=']'){
+            if(c>=(unsigned char)**pat&&c<=(unsigned char)*((*pat)+2)) matched=1;
+            (*pat)+=3;
+        } else { if(c==(unsigned char)**pat) matched=1; (*pat)++; }
+    }
+    if (**pat==']') (*pat)++;
+    return matched!=neg;
+}
+
+static int tt__re_match(const char *pat, const char *s) {
+    if (!*pat) return 1;
+    if (*pat=='$'&&!*(pat+1)) return !*s;
+    if (*pat=='^') return tt__re_match(pat+1, s);
+    if (*pat=='[') {
+        const char *p2=pat;
+        int matched2 = *s ? tt__re_match_bracket(&p2, (unsigned char)*s) : 0;
+        if (*(p2)=='*') {
+            if (tt__re_match(p2+1,s)) return 1;
+            if (matched2&&tt__re_match(pat,s+1)) return 1;
+            return 0;
+        }
+        if (*(p2)=='+') {
+            if (!matched2) return 0;
+            return tt__re_match(p2+1,s+1)||tt__re_match(pat,s+1);
+        }
+        if (*(p2)=='?') {
+            if (matched2&&tt__re_match(p2+1,s+1)) return 1;
+            return tt__re_match(p2+1,s);
+        }
+        return matched2&&tt__re_match(p2,s+1);
+    }
+    int dot_match = *s && (*pat=='.'||*pat==(unsigned char)*s);
+    if (*(pat+1)=='*') {
+        if (tt__re_match(pat+2,s)) return 1;
+        if (dot_match&&tt__re_match(pat,s+1)) return 1;
+        return 0;
+    }
+    if (*(pat+1)=='+') {
+        if (!dot_match) return 0;
+        return tt__re_match(pat+2,s+1)||tt__re_match(pat,s+1);
+    }
+    if (*(pat+1)=='?') {
+        if (dot_match&&tt__re_match(pat+2,s+1)) return 1;
+        return tt__re_match(pat+2,s);
+    }
+    return dot_match&&tt__re_match(pat+1,s+1);
+}
+
+TT_INLINE int tt_regex_match(const char *pattern, const char *s) {
+    if (*pattern=='^') return tt__re_match(pattern,s);
+    do { if (tt__re_match(pattern,s)) return 1; } while (*s++);
+    return 0;
+}
+
+
+TT_INLINE void tt_scanlines(int x, int y, int w, int h) {
+    int j;
+    for (j=y; j<y+h; j+=2) tt_fill(x, j, w, 1, '\xb7');                 
+}
+
+TT_INLINE void tt_matrix_rain(int col_count) {
+    static char tt__mrain_pos[256];
+    static int  tt__mrain_init = 0;
+    int i;
+    TT_Size sz = tt_term_size();
+    if (!tt__mrain_init) {
+        for (i=0;i<256;i++) tt__mrain_pos[i]=(char)tt_rand_range(0,sz.h);
+        tt__mrain_init=1;
+    }
+    for (i=0;i<col_count&&i<sz.w;i++){
+        char ch[2];
+        ch[0]=(char)tt_rand_range('!','~'); ch[1]='\0';
+        tt_draw(i+1, (int)(unsigned char)tt__mrain_pos[i], "\033[32m");
+        tt_write(ch);
+        tt_write(TT_RESET);
+        tt__mrain_pos[i]=(char)((tt__mrain_pos[i]+1)%sz.h);
+    }
+}
+
+TT_INLINE void tt_crt_cursor(int x, int y, int visible) {
+    tt_draw(x, y, visible ? "\033[32m_\033[0m" : " ");
+}
+
+
+TT_INLINE void tt_print_sysinfo(void) {
+    const char *platform =
+#if defined(TT_WINDOWS)
+        "Windows";
+#elif defined(TT_LINUX)
+        "Linux";
+#elif defined(TT_MACOS)
+        "macOS";
+#elif defined(TT_BSD)
+        "BSD";
+#elif defined(TT_DOS)
+        "DOS";
+#else
+        "Unknown";
+#endif
+    printf("termtools.h extended -- build info:\n");
+#if defined(__GNUC__)
+    printf("  Compiler : GCC %d.%d.%d\n", __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
+#elif defined(_MSC_VER)
+    printf("  Compiler : MSVC %d\n", _MSC_VER);
+#elif defined(__clang__)
+    printf("  Compiler : Clang %d.%d\n", __clang_major__, __clang_minor__);
+#endif
+#if defined(__STDC_VERSION__)
+    printf("  C std    : %ld\n", (long)__STDC_VERSION__);
+#else
+    printf("  C std    : C89\n");
+#endif
+    printf("  Platform : %s\n", platform);
+    printf("  Endian   : %s\n", tt_is_little_endian() ? "little" : "big");
+    printf("  sizeof(int): %d  sizeof(long): %d  sizeof(void*): %d\n",
+           (int)sizeof(int), (int)sizeof(long), (int)sizeof(void*));
+}
 
 #endif                  
 
