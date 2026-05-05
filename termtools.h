@@ -30,7 +30,7 @@
  * Platforms tested / targeted:
  *   Windows 95 / 98 / ME / NT 4 / 2000 / XP / Vista / 7 / 8 / 10 / 11
  *   Linux 2.0+, macOS 10.0+, BSD variants, Solaris, IRIX, AIX, BeOS
- *   DOS (DJGPP), Haiku, Plan 9 (limited), any POSIX.1 system
+ *   Haiku, Plan 9 (limited), any POSIX.1 system
  *
  * USAGE
  *   #define TERMTOOLS_IMPLEMENTATION   (in exactly ONE .c / .cpp file)
@@ -49,6 +49,7 @@
  *
  * And as always, thanks for using our software <3! - TERMTOOLS Contributors
  */
+
 
 
 #if !defined(_WIN32) && !defined(__MSDOS__)
