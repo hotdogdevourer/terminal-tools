@@ -22,7 +22,7 @@ termtools.h is a C89/C90 compatible header-only library (with minor C99 fallback
 - Encoding (Base64, CRC32, Hex dump)
 - And various other tiny tools like INI parsing, CSV parsing, and benchmarking.
 
-It targets a wide range of platforms, including Windows (95 through 11), Linux, macOS, BSDs, DOS, Haiku, and generally any POSIX.1 system.
+It targets a wide range of platforms, including Windows (95 through 11), Linux, macOS, BSDs, Haiku, and generally any POSIX.1 system.
 
 ## Usage
 
@@ -124,7 +124,6 @@ We have tested or targeted:
 - macOS 10.0+
 - BSD variants
 - Solaris, IRIX, AIX
-- DOS (DJGPP)
 - Haiku
 - Plan 9 (limited)
 - Any POSIX.1 system
